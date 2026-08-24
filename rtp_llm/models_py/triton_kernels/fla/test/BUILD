@@ -1,7 +1,7 @@
 load("@arch_config//:arch_select.bzl", "requirement")
 load("@pip_gpu_rocm_torch//:requirements.bzl", requirement_gpu_rocm = "requirement")
 
-requirement(["triton", "torch", "numpy", "einops", "packaging"])
+requirement(["triton", "torch", "numpy", "einops", "packaging", "pytest"])
 
 # flydsl is ROCm-only (only present in pip_gpu_rocm requirements).
 # On non-ROCm configs we point to an empty stub to avoid analysis failures.
@@ -141,6 +141,18 @@ py_test(
     deps = [
         "//rtp_llm/models_py/triton_kernels:fla",
     ] + [":triton", ":torch", ":numpy", ":einops", ":packaging", ":flydsl"],
+    visibility = ["//visibility:public"],
+    tags = ["rocm"],
+    exec_properties = {'gpu':'MI308X-ROCM7'},
+)
+
+py_test(
+    name = "test_aiter_flydsl_gdn_prefill",
+    srcs = ["test_aiter_flydsl_gdn_prefill.py"],
+    main = "test_aiter_flydsl_gdn_prefill.py",
+    deps = [
+        "//rtp_llm/models_py/triton_kernels:fla",
+    ] + [":triton", ":torch", ":numpy", ":einops", ":packaging", ":pytest", ":flydsl"],
     visibility = ["//visibility:public"],
     tags = ["rocm"],
     exec_properties = {'gpu':'MI308X-ROCM7'},
