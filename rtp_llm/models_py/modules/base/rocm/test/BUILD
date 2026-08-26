@@ -67,6 +67,14 @@ py_test (
 )
 
 py_test(
+    name = "select_topk_test",
+    srcs = ["select_topk_test.py"],
+    deps = py_test_deps,
+    tags = ["rocm"],
+    exec_properties = {'gpu':'MI308X-ROCM7'},
+)
+
+py_test(
     name = "trt_allreduce_test",
     srcs = ["trt_allreduce_test.py"],
     deps = [
@@ -92,6 +100,22 @@ py_test(
     exec_properties = {'gpu':'MI308X-ROCM7', 'gpu_count':'2'},
 )
 
+
+py_test(
+    name = "test_trt_allreduce_3072_tp4_graph_replay",
+    srcs = ["test_trt_allreduce_graph_replay.py"],
+    main = "test_trt_allreduce_graph_replay.py",
+    args = ["TestTrtAllReduceGraphReplay.test_graph_replay_pure_allreduce_3072_tp4"],
+    deps = [
+        "//rtp_llm:testlib",
+        "//rtp_llm/models_py/modules/base/rocm:trt_allreduce",
+    ],
+    timeout = "long",
+    env = {"GPU_COUNT": "4"},
+    tags = ["rocm"],
+    exec_properties = {'gpu':'MI308X-ROCM7', 'gpu_count':'4'},
+)
+
 py_test(
     name = "test_unified_allreduce_tp",
     srcs = ["test_unified_allreduce_tp.py"],
@@ -103,4 +127,3 @@ py_test(
     tags = ["rocm"],
     exec_properties = {'gpu':'MI308X-ROCM7', 'gpu_count':'2'},
 )
-

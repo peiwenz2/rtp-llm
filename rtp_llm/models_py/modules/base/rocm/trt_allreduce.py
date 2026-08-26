@@ -31,7 +31,7 @@ FP8_QUANT_TYPE_ID = FP8_QUANT_TYPE_IDS[FP8_DTYPE]
 
 # Supported hidden_size for trtllm allreduce kernels (pure allreduce).
 # Must match the switch cases in allreduce_kernel_launcher_hd (trtllm_allreduce_fusion.cu).
-ALLREDUCE_SUPPORTED_HIDDEN_SIZES = frozenset({1024, 2048, 2560, 4096, 5120})
+ALLREDUCE_SUPPORTED_HIDDEN_SIZES = frozenset({1024, 2048, 2560, 3072, 4096, 5120})
 
 # Supported hidden_size for fused allreduce + residual + rmsnorm kernels.
 # Must match the switch cases in allreduce_fusion_kernel_launcher_hd (trtllm_allreduce_fusion.cu).
@@ -504,5 +504,3 @@ def allreduce_residual_rmsnorm(
     return _trtllm_comm_manager.dist_env.allreduce_add_rms_fused(
         allreduce_in, residual_in, rms_weight, eps, fp8_out,
     )
-
-

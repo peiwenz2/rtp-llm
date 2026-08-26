@@ -55,7 +55,7 @@ def make_config() -> AttentionConfigs:
     config.max_seq_len = 40960
     config.kv_cache_dtype = KvCacheDataType.BASE
     config.dtype = torch.bfloat16
-    config.need_rope_kv_cache = False
+    config.need_rope_kv_cache = True
     return config
 
 
@@ -200,26 +200,42 @@ class AiterDecodeLayoutParityTest(unittest.TestCase):
         )
         self.assertGreater(mismatched_l2, 0.1, f"{mismatched_l2=:.6f}")
 
+    @staticmethod
+    def _select_impl(inputs, kv_dtype, use_asm_pa, use_triton_pa):
+        config = make_config()
+        config.kv_cache_dtype = kv_dtype
+        fmha_config = FMHAConfig()
+        fmha_config.use_aiter_pa = True
+        fmha_config.use_asm_pa = use_asm_pa
+        fmha_config.use_triton_pa = use_triton_pa
+        return attn_factory.get_fmha_impl(config, None, inputs, fmha_config=fmha_config)
+
     def test_factory_pairs_reader_and_writer(self):
         inputs = make_inputs(torch.device("cuda"))
-        for kv_dtype, use_asm_pa, expected_linear_v, expected_writer in (
+        for kv_dtype, use_asm_pa, linear_v, writer in (
             (KvCacheDataType.BASE, False, True, FusedRopeKVCacheDecodeOpNonAsm),
             (KvCacheDataType.BASE, True, False, FusedRopeKVCacheDecodeOpAsm),
-            (KvCacheDataType.FP8, False, False, FusedRopeKVCacheDecodeOpAsm),
+            (KvCacheDataType.FP8, False, True, FusedRopeKVCacheDecodeOpNonAsm),
         ):
             with self.subTest(kv_dtype=kv_dtype, use_asm_pa=use_asm_pa):
-                config = make_config()
-                config.kv_cache_dtype = kv_dtype
-                fmha_config = FMHAConfig()
-                fmha_config.use_aiter_pa = True
-                fmha_config.use_asm_pa = use_asm_pa
-                fmha_config.use_triton_pa = True
-                impl = attn_factory.get_fmha_impl(
-                    config, None, inputs, fmha_config=fmha_config
-                )
+                impl = self._select_impl(inputs, kv_dtype, use_asm_pa, True)
                 self.assertIsInstance(impl, AiterDecodeImplTriton)
-                self.assertEqual(impl.fmha_impl.linear_v, expected_linear_v)
-                self.assertIs(type(impl.rope_kvcache_impl), expected_writer)
+                self.assertIs(impl.fmha_impl.linear_v, linear_v)
+                self.assertIs(type(impl.rope_kvcache_impl), writer)
+
+    def test_factory_falls_back_to_linear_v_writer(self):
+        for use_asm_pa in (False, True):
+            with self.subTest(use_asm_pa=use_asm_pa):
+                impl = self._select_impl(
+                    make_inputs(torch.device("cuda")),
+                    KvCacheDataType.BASE,
+                    use_asm_pa,
+                    False,
+                )
+                self.assertIsInstance(impl, AiterDecodeImplNonAsm)
+                self.assertIs(
+                    type(impl.rope_kvcache_impl), FusedRopeKVCacheDecodeOpNonAsm
+                )
 
 
 if __name__ == "__main__":

@@ -218,6 +218,23 @@ class TestQwen3NextQkvzBaFusion(unittest.TestCase):
         self.assertIsNone(module.in_proj_qkvz)
         self.assertIsNone(module.in_proj_ba)
 
+    def test_grouped_norm_observes_online_weight_update(self) -> None:
+        from rtp_llm.utils.model_weight import W
+
+        module = self._build_module()
+        weight = module.weights[W.linear_attn_norm_w]
+        self.assertEqual(module.norm.weight.data_ptr(), weight.data_ptr())
+        x = torch.randn(2, 128, dtype=torch.bfloat16, device=self.device)
+        gate = torch.ones_like(x)
+        for value in (1, 2):
+            weight.fill_(value)
+            reference = type(module.norm)(
+                weight.repeat(module.local_num_v_heads),
+                eps=module.norm.eps,
+                group_size=module.norm.group_size,
+            )
+            torch.testing.assert_close(module.norm(x, gate), reference(x, gate))
+
     def test_rocm_swizzle_unaligned_bf16_uses_two_gemms(self) -> None:
         """A swizzled qkvz plus raw BA must never become one WithSwizzle GEMM."""
         from rtp_llm.utils.model_weight import W

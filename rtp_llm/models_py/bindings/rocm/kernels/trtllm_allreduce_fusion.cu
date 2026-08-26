@@ -772,6 +772,10 @@ void allreduce_kernel_launcher_hd(AllReduceFusionParams<T> const& params,
         case 4096:
             allreduce_kernel_launcher_<T, NRanks, 4096, QUANT_TYPE>(params, meta, cptrs, stream);
             return;
+        // Qwen3.5-122B-A10B hidden size.
+        case 3072:
+            allreduce_kernel_launcher_<T, NRanks, 3072, QUANT_TYPE>(params, meta, cptrs, stream);
+            return;
         case 2560:
             allreduce_kernel_launcher_<T, NRanks, 2560, QUANT_TYPE>(params, meta, cptrs, stream);
             return;
@@ -1472,6 +1476,11 @@ void allreduce(fptr_t fptr, Tensor& allreduce_in, Tensor& allreduce_out) {
     auto             stream     = c10::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream();
     int              size       = allreduce_in.numel();
     int              hidden_dim = allreduce_in.size(-1);
+    TORCH_CHECK(hidden_dim * allreduce_in.element_size() <= 16 * 1024,
+                "allreduce requires at most 1024 threads per block, got hidden_dim=",
+                hidden_dim,
+                ", element_size=",
+                allreduce_in.element_size());
     auto             ptr        = reinterpret_cast<CommWorkspace*>(fptr);
     auto             comm_data  = ptr->get_comm_data(allreduce_in, stream);
     AT_DISPATCH_FLOATING_TYPES_AND2(kHalf, kBFloat16, allreduce_in.scalar_type(), "allreduce", [&] {

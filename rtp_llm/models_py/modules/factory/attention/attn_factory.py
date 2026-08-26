@@ -128,16 +128,8 @@ def _is_fmha_impl_disabled(
     # FlashInfer native implementations
     elif "FlashInfer" in impl_class_name or "Flashinfer" in impl_class_name:
         return fmha_config.disable_flashinfer_native
-    # Aiter vectorized prefill writer.  Paged prefill and Triton decode consume
-    # vectorized V cache, so Aiter alone enables this writer as well as ASM.
-    elif "AiterPrefillImplAsm" in impl_class_name:
-        return not (
-            fmha_config.use_asm_pa
-            or fmha_config.use_aiter_pa
-            or fmha_config.use_triton_pa
-        )
-    elif "AiterPrefillImplPaged" in impl_class_name:
-        return not (fmha_config.use_asm_pa or fmha_config.use_aiter_pa)
+    elif impl_class_name in ("AiterPrefillImplAsm", "AiterPrefillImplPaged"):
+        return not fmha_config.use_asm_pa
     elif "AiterDecodeImplAsm" in impl_class_name:
         return not fmha_config.use_asm_pa
     # Aiter Non-ASM implementations
@@ -148,12 +140,25 @@ def _is_fmha_impl_disabled(
         return not fmha_config.use_aiter_pa
     # Aiter Triton implementations
     elif "AiterDecodeImplTriton" in impl_class_name:
-        return not (
-            fmha_config.use_triton_pa
-            or (fmha_config.use_aiter_pa and not fmha_config.use_asm_pa)
-        )
+        return not fmha_config.use_triton_pa
     # Default: not disabled
     return False
+
+
+_FATAL_DEVICE_ERROR_MARKERS = (
+    "illegal memory access",
+    "device-side assert",
+    "misaligned address",
+    "memory access fault",
+    "launch failed",
+    "launch failure",
+)
+
+
+def _is_fatal_device_fault(exc: Exception) -> bool:
+    return isinstance(exc, RuntimeError) and any(
+        marker in str(exc).lower() for marker in _FATAL_DEVICE_ERROR_MARKERS
+    )
 
 
 def get_fmha_impl(
@@ -170,7 +175,6 @@ def get_fmha_impl(
     attn_inputs.is_cuda_graph = is_cuda_graph
 
     mha_impls = PREFILL_MHA_IMPS if attn_inputs.is_prefill else DECODE_MHA_IMPS
-    # ROCm pins one V layout across prefill and decode; other backends do not.
     layout_ok = None
     if get_device_type() == DeviceType.ROCm:
         from rtp_llm.models_py.modules.factory.attention.rocm_impl.aiter import (
@@ -202,12 +206,15 @@ def get_fmha_impl(
         if not impl.support_parallelism_config(parallelism_config):
             skipped.append(f"{impl_class_name}: parallelism config unsupported")
             continue
+        kwargs = {"fmha_config": fmha_config} if impl.accepts_fmha_config else {}
         try:
-            instance = impl(attn_configs, attn_inputs, parallelism_config)
+            instance = impl(attn_configs, attn_inputs, parallelism_config, **kwargs)
             if not is_cuda_graph or instance.support_cuda_graph():
                 return instance
             skipped.append(f"{impl_class_name}: no cuda graph support")
         except Exception as e:
+            if _is_fatal_device_fault(e):
+                raise
             logging.warning(f"Failed to instantiate {impl_class_name}: {e}")
             skipped.append(f"{impl_class_name}: instantiation failed ({e})")
             continue

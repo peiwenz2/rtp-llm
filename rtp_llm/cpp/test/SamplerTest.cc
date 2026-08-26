@@ -18,6 +18,7 @@ protected:
     std::unique_ptr<Sampler> sampler_;
 };
 
+#if USING_CUDA
 TEST_F(SamplerTest, testDynamicGreedySamplingBuffersGrow) {
     Sampler sampler(SamplerInitParams{1, false});
 
@@ -50,6 +51,51 @@ TEST_F(SamplerTest, testFixedGreedySamplingBuffersRejectGrow) {
     Sampler sampler(SamplerInitParams{1, true});
 
     EXPECT_THROW(sampler.ensureGreedySamplingBuffers(2), rtp_llm::RTPException);
+}
+#endif
+
+TEST_F(SamplerTest, testTopOneProbabilityOutputsWithPaddedLogits) {
+    constexpr int64_t batch_size = 2;
+    auto              logits =
+        torch::tensor({{1.0f, 4.0f, 2.0f, 3.0f, -1000.0f, -1000.0f}, {5.0f, 2.0f, 1.0f, 0.0f, -1000.0f, -1000.0f}},
+                      torch::kFloat32)
+            .cuda();
+    auto initial_cum = torch::tensor({-2.0f, -3.0f}, torch::kFloat32).cuda();
+    auto point_mass  = torch::tensor({{0.f, 1.f, 0.f, 0.f}, {1.f, 0.f, 0.f, 0.f}});
+
+    SamplerInputs inputs;
+    inputs.logits        = logits.clone();
+    inputs.token_ids     = torch::zeros({batch_size, 2}, torch::kInt32);
+    inputs.input_lengths = inputs.sequence_lengths = torch::ones({batch_size}, torch::kInt32);
+    inputs.step                                    = 1;
+    inputs.batch_size = inputs.batch_size_out = batch_size;
+    inputs.num_beams_in = inputs.num_beams_out = torch::ones({batch_size}, torch::kLong);
+    inputs.top_k                               = torch::ones({batch_size}, torch::kInt32).pin_memory();
+    inputs.top_p                               = torch::zeros({batch_size}, torch::kFloat32).pin_memory();
+    inputs.temperature                         = torch::ones({batch_size}, torch::kFloat32).pin_memory();
+    inputs.cum_log_probs                       = initial_cum.clone();
+    inputs.all_probs                           = torch::empty_like(logits);
+    inputs.generator.resize(batch_size);
+
+    auto output = sampler_->forward(inputs);
+    EXPECT_EQ(output.all_probs.size(1), 6);
+    EXPECT_TRUE(torch::equal(output.all_probs.slice(1, 0, 4).cpu(), point_mass));
+    inputs.logits    = logits.clone();
+    inputs.all_probs = torch::empty({batch_size, 4}, logits.options());
+    output           = sampler_->forward(inputs);
+    EXPECT_EQ(output.all_probs.size(1), 4);
+    EXPECT_TRUE(torch::equal(output.all_probs.cpu(), point_mass));
+    EXPECT_TRUE(torch::equal(output.cum_log_probs, initial_cum));
+
+    inputs.logits                    = logits.clone();
+    inputs.cum_log_probs             = initial_cum.clone();
+    inputs.all_probs                 = torch::empty({batch_size, 4}, logits.options());
+    inputs.return_original_all_probs = true;
+    output                           = sampler_->forward(inputs);
+    auto probs                       = torch::softmax(logits, -1).slice(1, 0, 4);
+    auto selected                    = probs.gather(1, torch::tensor({{1}, {0}}, torch::kLong).cuda()).squeeze(1);
+    EXPECT_TRUE(torch::allclose(output.all_probs, probs));
+    EXPECT_TRUE(torch::allclose(output.cum_log_probs, initial_cum + selected.log()));
 }
 
 TEST_F(SamplerTest, testMixedDynamicBeamTransitionsUseIndependentOutput) {

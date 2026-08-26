@@ -313,6 +313,8 @@ static GreedyOutput flashinferSampleGreedy(const GreedyParams& params, const tor
     if (params.cum_log_probs.has_value() && !output_all_probs_t.defined()) {
         output_all_probs_t = torch::zeros_like(probs_t);
     }
+    const auto output_width   = output_all_probs_t.defined() ? output_all_probs_t.size(1) : probs_t.size(1);
+    const auto output_probs_t = probs_t.slice(1, 0, output_width).contiguous();
 
     // top_k/top_p are CPU tensors with int32/float32 dtype
     auto top_k_ptr = params.top_k.data_ptr<int32_t>();
@@ -331,7 +333,7 @@ static GreedyOutput flashinferSampleGreedy(const GreedyParams& params, const tor
         samples_t.copy_(selected_tokens, true);
         success = torch::Tensor();  // mark as undefined — all succeeded
         if (need_renorm_probs) {
-            top_k_renorm_probs(probs_t, output_all_probs_t, top_k_t, 0, (int64_t)cur_stream);
+            top_k_renorm_probs(output_probs_t, output_all_probs_t, top_k_t, 0, (int64_t)cur_stream);
         }
     } else if (all_top_k_no_limit) {
         top_p_sampling_from_probs(probs_t,
@@ -347,7 +349,7 @@ static GreedyOutput flashinferSampleGreedy(const GreedyParams& params, const tor
                                   0,
                                   (int64_t)cur_stream);
         if (need_renorm_probs) {
-            top_p_renorm_probs(probs_t, output_all_probs_t, top_p_t, 1.0, (int64_t)cur_stream);
+            top_p_renorm_probs(output_probs_t, output_all_probs_t, top_p_t, 1.0, (int64_t)cur_stream);
         }
     } else {
         // top_k<=0 means "no limit" in RTP config. The combined FlashInfer
@@ -368,7 +370,7 @@ static GreedyOutput flashinferSampleGreedy(const GreedyParams& params, const tor
                                       0,
                                       (int64_t)cur_stream);
             if (need_renorm_probs) {
-                top_k_renorm_probs(probs_t, output_all_probs_t, top_k_t, 0, (int64_t)cur_stream);
+                top_k_renorm_probs(output_probs_t, output_all_probs_t, top_k_t, 0, (int64_t)cur_stream);
             }
         } else {
             top_k_top_p_sampling_from_probs(probs_t,
@@ -387,14 +389,14 @@ static GreedyOutput flashinferSampleGreedy(const GreedyParams& params, const tor
                                             (int64_t)cur_stream);
             if (need_renorm_probs) {
                 torch::Tensor temp_t = torch::zeros_like(output_all_probs_t);
-                top_k_renorm_probs(probs_t, temp_t, top_k_t, 1.0, (int64_t)cur_stream);
+                top_k_renorm_probs(output_probs_t, temp_t, top_k_t, 1.0, (int64_t)cur_stream);
                 top_p_renorm_probs(temp_t, output_all_probs_t, top_p_t, 1.0, (int64_t)cur_stream);
             }
         }
     }
 
     if (params.return_original_all_probs && output_all_probs_t.defined()) {
-        top_k_renorm_probs(probs_t, output_all_probs_t, std::nullopt, 1 << 30, (int64_t)cur_stream);
+        top_k_renorm_probs(output_probs_t, output_all_probs_t, std::nullopt, 1 << 30, (int64_t)cur_stream);
     }
 
     if (params.cum_log_probs.has_value()) {
@@ -684,15 +686,20 @@ GreedyOutput sampleGreedy(const GreedyParams& params) {
         }
     }
 
-    // 3. Fast path for topk = 1
-    auto top_k_ptr = reinterpret_cast<uint32_t*>(params.top_k.data_ptr<int32_t>());
-    if (std::all_of(top_k_ptr, top_k_ptr + batch_size, [&](auto t) { return t == 1; })
-        && !params.output_all_probs.has_value()) {
+    // 3. A renormalized top-1 distribution is exactly one-hot.
+    auto       top_k_ptr     = reinterpret_cast<uint32_t*>(params.top_k.data_ptr<int32_t>());
+    const bool all_top_k_one = std::all_of(top_k_ptr, top_k_ptr + batch_size, [](auto t) { return t == 1; });
+    const bool can_write_point_mass =
+        !params.output_all_probs.has_value() || params.output_all_probs->size(1) == vocab_size_padded;
+    if (all_top_k_one && !params.return_original_all_probs && can_write_point_mass) {
         torch::Tensor samples_t =
             transposed_tokens.slice(0, transposed_tokens.size(0) - 1, transposed_tokens.size(0)).squeeze(0);
-        torch::Tensor probs_t         = params.logits;
-        torch::Tensor selected_tokens = torch::argmax(probs_t, -1, /*keepdim=*/false);
+        torch::Tensor selected_tokens = torch::argmax(params.logits, -1, /*keepdim=*/false);
         samples_t.copy_(selected_tokens);
+        if (params.output_all_probs.has_value()) {
+            params.output_all_probs->zero_();
+            params.output_all_probs->scatter_(1, selected_tokens.unsqueeze(1), 1.0);
+        }
 
         auto output_tokens = transposed_tokens.transpose(0, 1).contiguous();
         params.token_ids.copy_(output_tokens);
@@ -720,7 +727,6 @@ GreedyOutput sampleGreedy(const GreedyParams& params) {
     auto top_p_t   = params.top_p;
     auto top_p_ptr = params.top_p.data_ptr<float>();
 
-    bool          need_renorm_probs = params.output_all_probs.has_value() && !params.return_original_all_probs;
     torch::Tensor output_all_probs_t;
     if (params.output_all_probs.has_value()) {
         output_all_probs_t = params.output_all_probs.value();
@@ -728,15 +734,18 @@ GreedyOutput sampleGreedy(const GreedyParams& params) {
     if (params.cum_log_probs.has_value() && !output_all_probs_t.defined()) {
         output_all_probs_t = torch::zeros_like(probs_t);
     }
+    const bool need_renorm_probs = output_all_probs_t.defined() && !params.return_original_all_probs;
+    const auto output_width      = output_all_probs_t.defined() ? output_all_probs_t.size(1) : probs_t.size(1);
+    const auto output_probs_t    = probs_t.slice(1, 0, output_width).contiguous();
 
     std::transform(top_p_ptr, top_p_ptr + batch_size, top_p_ptr, [&](auto t) { return std::abs(t) < 1e-7 ? 1.0 : t; });
 
     // 6. Sample
-    if (std::all_of(top_k_ptr, top_k_ptr + batch_size, [&](auto t) { return t == 1; })) {
+    if (all_top_k_one) {
         torch::Tensor selected_tokens = torch::argmax(probs_t, -1, /*keepdim=*/false);
         samples_t.copy_(selected_tokens);
         if (need_renorm_probs) {
-            top_k_renorm_probs(probs_t, output_all_probs_t, top_k_t, 0, reinterpret_cast<uintptr_t>(cur_stream));
+            top_k_renorm_probs(output_probs_t, output_all_probs_t, top_k_t, 0, reinterpret_cast<uintptr_t>(cur_stream));
         }
     } else {
         // Use pure PyTorch sampling instead of FlashInfer ROCm kernels.
@@ -781,18 +790,20 @@ GreedyOutput sampleGreedy(const GreedyParams& params) {
         auto selected  = torch::multinomial(filtered_probs, 1, /*replacement=*/false).squeeze(-1);
         samples_t.copy_(selected);
         if (need_renorm_probs) {
-            output_all_probs_t.copy_(filtered_probs);
+            output_all_probs_t.copy_(filtered_probs.slice(1, 0, output_width));
         }
     }
 
     if (params.return_original_all_probs && output_all_probs_t.defined()) {
-        top_k_renorm_probs(probs_t, output_all_probs_t, std::nullopt, 1 << 30, reinterpret_cast<uintptr_t>(cur_stream));
+        top_k_renorm_probs(
+            output_probs_t, output_all_probs_t, std::nullopt, 1 << 30, reinterpret_cast<uintptr_t>(cur_stream));
     }
 
     // 7. Update cum_log_probs
     if (params.cum_log_probs.has_value()) {
         auto cum_log_probs_t = params.cum_log_probs.value();
-        cum_log_probs_t.add_(probs_t.log());
+        auto token_probs_t   = output_all_probs_t.gather(1, samples_t.to(torch::kLong).unsqueeze(1)).squeeze(1);
+        cum_log_probs_t.add_(token_probs_t.log().to(cum_log_probs_t.device()));
     }
 
     // 8. Copy results back
