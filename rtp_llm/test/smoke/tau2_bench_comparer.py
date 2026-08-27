@@ -9,6 +9,7 @@ import sys
 import tarfile
 import tempfile
 import urllib.request
+from importlib import metadata
 from typing import Any, List, Optional
 
 from smoke.base_comparer import BaseComparer
@@ -24,6 +25,8 @@ DEFAULT_MODEL_ARG = "Qwen3-30B"
 DEFAULT_TASK_IDS_FILE = "passing_tasks.json"
 DEFAULT_SCRIPT_FILE = "run_tau2_bench.py"
 EVALSCOPE_PINNED_VERSION = "1.6.0"
+# Keep this aligned with tau2-bench/pdm.lock in TAU2_TARBALL_URL.
+LITELLM_PINNED_VERSION = "1.65.1"
 
 _REPORT_PATH_RE = re.compile(r"Dump report to:\s*(\S+\.json)")
 
@@ -41,6 +44,7 @@ class Tau2BenchComparer(BaseComparer):
 
         extract_root = self._download_and_extract(out_dir)
         self._install_evalscope()
+        self._install_litellm()
         self._install_tau2_from_tarball(extract_root)
         task_ids_path = self._resolve_task_ids_file(extract_root, task_ids_file)
         script_path = self._resolve_script_file(extract_root, script_file)
@@ -99,6 +103,25 @@ class Tau2BenchComparer(BaseComparer):
         except ImportError:
             pass
         self._pip_install([pinned_spec])
+
+    def _install_litellm(self) -> None:
+        """Keep tau2's LiteLLM dependency aligned with its checked-in lock file."""
+        pinned_spec = f"litellm=={LITELLM_PINNED_VERSION}"
+        try:
+            current = metadata.version("litellm")
+        except metadata.PackageNotFoundError:
+            self._pip_install([pinned_spec])
+            return
+
+        if current == LITELLM_PINNED_VERSION:
+            logging.info(f"[TAU2] {pinned_spec} matches pinned, skip install")
+            return
+
+        logging.info(
+            f"[TAU2] litellm=={current} != pinned {LITELLM_PINNED_VERSION}, "
+            "force reinstall"
+        )
+        self._pip_install(["--force-reinstall", "--no-deps", pinned_spec])
 
     def _install_tau2_from_tarball(self, extract_root: str) -> None:
         try:
