@@ -25,8 +25,10 @@ DEFAULT_MODEL_ARG = "Qwen3-30B"
 DEFAULT_TASK_IDS_FILE = "passing_tasks.json"
 DEFAULT_SCRIPT_FILE = "run_tau2_bench.py"
 EVALSCOPE_PINNED_VERSION = "1.6.0"
-# Keep this aligned with tau2-bench/pdm.lock in TAU2_TARBALL_URL.
-LITELLM_PINNED_VERSION = "1.65.1"
+# Freeze the LiteLLM version used when this benchmark and its passing-task
+# baseline were introduced.  The tau2 source declares ``litellm>=1.65.0``;
+# installing its source ignores pdm.lock and originally resolved to 1.83.14.
+LITELLM_PINNED_VERSION = "1.83.14"
 
 _REPORT_PATH_RE = re.compile(r"Dump report to:\s*(\S+\.json)")
 
@@ -105,7 +107,7 @@ class Tau2BenchComparer(BaseComparer):
         self._pip_install([pinned_spec])
 
     def _install_litellm(self) -> None:
-        """Keep tau2's LiteLLM dependency aligned with its checked-in lock file."""
+        """Restore the LiteLLM version used to establish this smoke baseline."""
         pinned_spec = f"litellm=={LITELLM_PINNED_VERSION}"
         try:
             current = metadata.version("litellm")
