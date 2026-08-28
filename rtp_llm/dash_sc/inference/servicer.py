@@ -15,6 +15,8 @@ coroutine automatically.
 from __future__ import annotations
 
 import inspect
+import hashlib
+import json
 import logging
 import threading
 from dataclasses import dataclass
@@ -50,6 +52,7 @@ from rtp_llm.dash_sc.codec import (
     build_stream_response_from_generate_outputs,
     iter_fake_model_stream_infer,
     parse_dash_sc_grpc_request,
+    parse_ds_header_attributes,
     parse_multimodal_parts_from_request,
     parse_pretokenized_chat_controls_with_sources,
     prepend_to_generated_ids_tensor,
@@ -86,6 +89,129 @@ _INT32_MAX = 2_147_483_647
 _PARTIAL_RESPONSE_METADATA = (("x-dashscope-partialresponse", "true"),)
 _PRETOKENIZED_CHAT_FALLBACK_LOG_COUNTS: dict[tuple[Any, ...], int] = {}
 _PRETOKENIZED_CHAT_FALLBACK_LOG_LOCK = threading.Lock()
+_GRAMMAR_CONTROL_KEYS = frozenset(
+    {
+        "enable_thinking",
+        "guided_json",
+        "json_format",
+        "parallel_tool_calls",
+        "response_format",
+        "structural_tag",
+        "thinking_budget",
+        "tool_call_structural_tag",
+        "tool_choice",
+        "tools",
+        "x-ds-llm-thinking",
+        "x-ds-llm-tool-choice",
+    }
+)
+
+
+def _selected_ds_header_controls_for_log(value: Any) -> dict[str, Any]:
+    """Extract exact grammar controls while excluding prompts and unrelated headers."""
+    selected: dict[str, Any] = {}
+
+    def visit(current: Any, prefix: str) -> None:
+        if not isinstance(current, dict):
+            return
+        for key, child in current.items():
+            key_text = str(key)
+            path = f"{prefix}.{key_text}" if prefix else key_text
+            if key_text.lower() in _GRAMMAR_CONTROL_KEYS:
+                selected[path] = child
+            else:
+                visit(child, path)
+
+    visit(value, "request.parameters.ds_header_attributes")
+    return selected
+
+
+def _parsed_json_for_log(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    try:
+        return json.loads(value)
+    except (TypeError, ValueError):
+        return value
+
+
+def _serialized_value_diagnostics(value: Any) -> dict[str, Any]:
+    if value is None:
+        return {"present": False}
+    serialized = (
+        value
+        if isinstance(value, str)
+        else json.dumps(
+            value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+    )
+    return {
+        "present": True,
+        "serialized": serialized,
+        "parsed": _parsed_json_for_log(serialized),
+        "utf8_bytes": len(serialized.encode("utf-8")),
+        "sha256": hashlib.sha256(serialized.encode("utf-8")).hexdigest(),
+    }
+
+
+def _log_dashsc_request_parameters(
+    request: Any,
+    tag: str,
+    sampling: SamplingParams,
+    other: OtherParams,
+    ds_attrs: dict[str, Any],
+    chat_controls: dict[str, Any],
+    chat_control_sources: dict[str, str],
+    generate_config: GenerateConfig,
+    constraint_applier_called: bool,
+    constraint_source: Optional[str],
+) -> None:
+    """Log exact grammar controls without logging prompt/messages or unrelated headers."""
+    request_structural_tag = _serialized_value_diagnostics(sampling.structural_tag)
+    request_structural_tag["source"] = sampling.structural_tag_source
+    request_structural_tag["raw_wire_value"] = sampling.structural_tag_raw
+
+    response_format = _serialized_value_diagnostics(sampling.response_format)
+    response_format["source"] = sampling.response_format_source
+    response_format["raw_wire_value"] = sampling.response_format_raw
+
+    final_structural_tag = _serialized_value_diagnostics(generate_config.structural_tag)
+    if sampling.structural_tag is not None:
+        final_source = f"request:{sampling.structural_tag_source or 'unknown'}"
+    elif constraint_applier_called and generate_config.structural_tag is not None:
+        final_source = f"rtp_python_fallback:{constraint_source or 'unspecified'}"
+    else:
+        final_source = "none_before_cpp_factory"
+    final_structural_tag["source"] = final_source
+
+    summary = {
+        "path": "dashsc",
+        "request_id": request.id,
+        "request_parameter_fields": sorted(str(key) for key in request.parameters),
+        "request_input_fields": sorted(
+            str(getattr(request_input, "name", "")) for request_input in request.inputs
+        ),
+        "ds_header_grammar_controls": _selected_ds_header_controls_for_log(ds_attrs),
+        "chat_controls": chat_controls,
+        "chat_control_sources": chat_control_sources,
+        "enable_thinking": other.enable_thinking,
+        "response_format": response_format,
+        "json_format": sampling.json_format,
+        "request_structural_tag": request_structural_tag,
+        "constraint_resolution": {
+            "python_applier_called": constraint_applier_called,
+            "python_applier_result": constraint_source,
+            "final_in_think_mode": bool(
+                getattr(generate_config, "in_think_mode", False)
+            ),
+            "final_structural_tag": final_structural_tag,
+        },
+    }
+    logging.info(
+        "[DashScGrpc] [%s] [grammar-request] %s",
+        tag,
+        json.dumps(summary, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+    )
 
 
 def _log_pretokenized_chat_constraint_fallback(
@@ -629,6 +755,10 @@ async def iter_real_model_stream_infer(
     trace_str = str(request.id)
     tag = stream_log_tag(request_id_numeric=rtp_llm_request_id, trace_id=trace_str)
     runtime = think_runtime if think_runtime is not None else _ThinkRuntime()
+    ds_attrs = parse_ds_header_attributes(request)
+    chat_controls, chat_control_sources = parse_pretokenized_chat_controls_with_sources(
+        request, ds_attrs
+    )
     logging.debug(
         "[DashScGrpc] [%s] real infer start: model_name=%s input_len=%s sampling=%s",
         tag,
@@ -667,13 +797,13 @@ async def iter_real_model_stream_infer(
         ):
             generate_config.end_think_token_ids = list(runtime.eos_tokens)
         _apply_request_overrides(generate_config, sampling, other, runtime)
+        constraint_applier_called = False
+        constraint_source = None
         if (
             pretokenized_chat_constraint_applier is not None
             and generate_config.structural_tag is None
         ):
-            chat_controls, chat_control_sources = (
-                parse_pretokenized_chat_controls_with_sources(request)
-            )
+            constraint_applier_called = True
             constraint_source = pretokenized_chat_constraint_applier(
                 chat_controls,
                 generate_config,
@@ -687,6 +817,18 @@ async def iter_real_model_stream_infer(
                     chat_controls,
                     chat_control_sources,
                 )
+        _log_dashsc_request_parameters(
+            request,
+            tag,
+            sampling,
+            other,
+            ds_attrs,
+            chat_controls,
+            chat_control_sources,
+            generate_config,
+            constraint_applier_called,
+            constraint_source,
+        )
         if extra_stop_word_ids:
             existing = generate_config.stop_words_list
             if existing:

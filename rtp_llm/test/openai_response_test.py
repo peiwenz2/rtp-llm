@@ -37,7 +37,10 @@ from rtp_llm.openai.api_datatype import (
     GPTToolDefinition,
     RoleEnum,
 )
-from rtp_llm.openai.openai_endpoint import OpenaiEndpoint
+from rtp_llm.openai.openai_endpoint import (
+    OpenaiEndpoint,
+    _openai_request_parameter_summary,
+)
 from rtp_llm.openai.renderer_factory import ChatRendererFactory, RendererParams
 from rtp_llm.openai.renderers import custom_renderer
 from rtp_llm.openai.renderers.chatglm45_renderer import ChatGlm45Renderer
@@ -454,6 +457,45 @@ class OpenaiResponseTest(IsolatedAsyncioTestCase):
         self.model_config.max_seq_len = 1024
         self.model_config.vocab_size = 1024
         self.model_config.special_tokens = SpecialTokens()
+
+    def test_request_parameter_summary_omits_payloads(self):
+        request = ChatCompletionRequest(
+            model="kimi-k3",
+            messages=[ChatMessage(role=RoleEnum.user, content="private prompt")],
+            tools=[
+                GPTToolDefinition(
+                    function=GPTFunctionDefinition(
+                        name="lookup",
+                        description="private description",
+                        parameters={"type": "object", "secret": "do-not-log"},
+                    )
+                )
+            ],
+            tool_choice="auto",
+            parallel_tool_calls=False,
+            max_tokens=17,
+        )
+
+        summary = _openai_request_parameter_summary(
+            request,
+            {
+                "model": "kimi-k3",
+                "messages": [{"content": "private prompt"}],
+                "tools": [{"secret": "do-not-log"}],
+                "unknown_extension": {"secret": "do-not-log"},
+            },
+        )
+
+        self.assertEqual(
+            summary["raw_body_fields"],
+            ["messages", "model", "tools", "unknown_extension"],
+        )
+        self.assertEqual(summary["tools_count"], 1)
+        self.assertEqual(summary["tool_names"], ["lookup"])
+        self.assertEqual(summary["tool_choice"], "auto")
+        self.assertFalse(summary["parallel_tool_calls"])
+        self.assertNotIn("private prompt", json.dumps(summary))
+        self.assertNotIn("do-not-log", json.dumps(summary))
 
     async def test_parse_qwen_function_call(self):
         tokenizer = QwenTestTokenizer(

@@ -35,6 +35,7 @@ from rtp_llm.dash_sc.codec import (
     LLMFinishReason,
     OtherParams,
     SamplingParams,
+    parse_sampling_params,
 )
 from rtp_llm.dash_sc.inference.servicer import (
     DashScInferenceServicer,
@@ -63,6 +64,13 @@ def _add_input_tensor(
 
 def _unpack_int32_le(raw: bytes) -> list[int]:
     return list(struct.unpack("<%di" % (len(raw) // 4), raw))
+
+
+def _single_grammar_request_log(messages: list[str]) -> dict:
+    logs = [message for message in messages if "[grammar-request]" in message]
+    if len(logs) != 1:
+        raise AssertionError(f"expected one grammar-request log, got {logs!r}")
+    return json.loads(logs[0].split("[grammar-request] ", 1)[1])
 
 
 class _FakeAsyncStream:
@@ -342,23 +350,161 @@ class IterRealModelStreamInferTest(unittest.IsolatedAsyncioTestCase):
             generate_config.in_think_mode = False
             return "test_request_tools"
 
-        chunks = await _drain(
-            iter_real_model_stream_infer(
-                req,
-                [1, 2],
-                SamplingParams(),
-                OtherParams(enable_thinking=True),
-                visitor,
-                rtp_llm_request_id=1,
-                pretokenized_chat_constraint_applier=apply_constraint,
+        with self.assertLogs(level="INFO") as captured:
+            chunks = await _drain(
+                iter_real_model_stream_infer(
+                    req,
+                    [1, 2],
+                    SamplingParams(),
+                    OtherParams(enable_thinking=True),
+                    visitor,
+                    rtp_llm_request_id=1,
+                    pretokenized_chat_constraint_applier=apply_constraint,
+                )
             )
-        )
 
         self.assertEqual(len(chunks), 1)
         self.assertEqual(observed["tool_choice"], "auto")
         self.assertEqual(observed["tools"][0]["function"]["name"], "bash")
         self.assertFalse(visitor.last_generate_input.generate_config.in_think_mode)
         self.assertIsNotNone(visitor.last_generate_input.generate_config.structural_tag)
+        diagnostic = _single_grammar_request_log(captured.output)
+        self.assertTrue(diagnostic["constraint_resolution"]["python_applier_called"])
+        self.assertEqual(
+            diagnostic["constraint_resolution"]["python_applier_result"],
+            "test_request_tools",
+        )
+        self.assertEqual(
+            diagnostic["constraint_resolution"]["final_structural_tag"]["source"],
+            "rtp_python_fallback:test_request_tools",
+        )
+        self.assertEqual(
+            diagnostic["constraint_resolution"]["final_structural_tag"]["parsed"][
+                "format"
+            ]["value"],
+            "x",
+        )
+
+    async def test_request_parameter_log_reports_fields_and_sources(self) -> None:
+        req = self._minimal_request()
+        req.parameters["temperature"].string_param = "0.5"
+        req.parameters["ds_header_attributes"].string_param = json.dumps(
+            {
+                "x-ds-llm-tool-choice": "none",
+                "payload": {
+                    "parameters": {
+                        "tools": [
+                            {
+                                "type": "function",
+                                "function": {
+                                    "name": "lookup",
+                                    "description": "private description",
+                                    "parameters": {
+                                        "type": "object",
+                                        "secret": "do-not-log",
+                                    },
+                                },
+                            }
+                        ],
+                        "tool_choice": "auto",
+                    }
+                },
+            }
+        )
+        out = GenerateOutput(
+            output_ids=torch.tensor([3], dtype=torch.int32),
+            finished=True,
+            aux_info=AuxInfo(input_len=2, reuse_len=0),
+        )
+        visitor = _FakeVisitor(
+            _FakeAsyncStream([GenerateOutputs(generate_outputs=[out])])
+        )
+
+        with self.assertLogs(level="INFO") as captured:
+            await _drain(
+                iter_real_model_stream_infer(
+                    req,
+                    [1, 2],
+                    SamplingParams(),
+                    OtherParams(),
+                    visitor,
+                    rtp_llm_request_id=1,
+                )
+            )
+
+        diagnostic = _single_grammar_request_log(captured.output)
+        self.assertEqual(diagnostic["path"], "dashsc")
+        self.assertIn("temperature", diagnostic["request_parameter_fields"])
+        self.assertEqual(
+            diagnostic["chat_control_sources"]["tools"],
+            "request.parameters.ds_header_attributes.payload.parameters.tools",
+        )
+        tool = diagnostic["chat_controls"]["tools"][0]["function"]
+        self.assertEqual(tool["name"], "lookup")
+        self.assertEqual(tool["description"], "private description")
+        self.assertEqual(tool["parameters"]["secret"], "do-not-log")
+        self.assertEqual(diagnostic["chat_controls"]["tool_choice"], "auto")
+        self.assertEqual(
+            diagnostic["ds_header_grammar_controls"][
+                "request.parameters.ds_header_attributes.x-ds-llm-tool-choice"
+            ],
+            "none",
+        )
+
+    async def test_request_structural_tag_log_preserves_wire_and_skips_fallback(
+        self,
+    ) -> None:
+        req = self._minimal_request()
+        structural_tag = {
+            "format": {
+                "type": "const_string",
+                "value": "request-tag-exact-value",
+            }
+        }
+        raw_tag = json.dumps([json.dumps(structural_tag)], ensure_ascii=False)
+        req.parameters["tool_call_structural_tag"].string_param = raw_tag
+        sampling = parse_sampling_params(req)
+        out = GenerateOutput(
+            output_ids=torch.tensor([3], dtype=torch.int32),
+            finished=True,
+            aux_info=AuxInfo(input_len=2, reuse_len=0),
+        )
+        visitor = _FakeVisitor(
+            _FakeAsyncStream([GenerateOutputs(generate_outputs=[out])])
+        )
+
+        def unexpected_fallback(*_args):
+            self.fail("request structural_tag must bypass the Python fallback")
+
+        with self.assertLogs(level="INFO") as captured:
+            await _drain(
+                iter_real_model_stream_infer(
+                    req,
+                    [1, 2],
+                    sampling,
+                    OtherParams(enable_thinking=True),
+                    visitor,
+                    rtp_llm_request_id=1,
+                    pretokenized_chat_constraint_applier=unexpected_fallback,
+                )
+            )
+
+        diagnostic = _single_grammar_request_log(captured.output)
+        request_tag = diagnostic["request_structural_tag"]
+        self.assertEqual(
+            request_tag["source"],
+            "request.parameters.tool_call_structural_tag",
+        )
+        self.assertEqual(request_tag["raw_wire_value"], raw_tag)
+        self.assertEqual(
+            request_tag["parsed"]["format"]["value"],
+            "request-tag-exact-value",
+        )
+        self.assertFalse(diagnostic["constraint_resolution"]["python_applier_called"])
+        self.assertEqual(
+            diagnostic["constraint_resolution"]["final_structural_tag"]["source"],
+            "request:request.parameters.tool_call_structural_tag",
+        )
 
     async def test_pretokenized_stringified_tools_reach_constraint_hook(self) -> None:
         req = self._minimal_request()

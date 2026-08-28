@@ -54,6 +54,7 @@ protected:
     std::shared_ptr<CacheStoreServerLoadMetricsCollector> collector_;
     MockCacheLoadServiceClosure*                          done_{nullptr};
     std::shared_ptr<TimerManager>                         timer_manager_;
+    std::string                                           duplicate_block_key_;
 
     std::shared_ptr<TcpCacheStoreServiceImplContext> context_;
 
@@ -104,6 +105,7 @@ bool TcpCacheStoreServiceImplContextTest::initContext(bool add_duplicate_block) 
         return false;
     }
     if (add_duplicate_block) {
+        duplicate_block_key_ = request_->blocks(0).key();
         request_->add_blocks()->CopyFrom(request_->blocks(0));
     }
 
@@ -242,7 +244,7 @@ TEST_F(TcpCacheStoreServiceImplContextTest, loadProgressDebugInfo_DuplicateKeys)
 
     const auto progress = context_->getLoadProgressDebugInfo();
     EXPECT_THAT(progress, testing::HasSubstr("total=11, unique_expected=10, duplicate_request_keys=1"));
-    EXPECT_THAT(progress, testing::HasSubstr("sample_duplicate_keys=[b0]"));
+    EXPECT_THAT(progress, testing::HasSubstr("sample_duplicate_keys=[" + duplicate_block_key_ + "]"));
 
     EXPECT_CALL(*done_, Run()).Times(1);
     context_->runFailed(KvCacheStoreServiceErrorCode::EC_FAILED_LOAD_BUFFER,

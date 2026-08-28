@@ -166,8 +166,8 @@ class DashScGrpcRequestTest(TestCase):
 
         self.assertEqual(controls["tools"][0]["function"]["name"], "direct")
         self.assertEqual(controls["tool_choice"], "auto")
-        self.assertEqual(sources["tools"], "parameters")
-        self.assertEqual(sources["tool_choice"], "parameters")
+        self.assertEqual(sources["tools"], "request.parameters.tools")
+        self.assertEqual(sources["tool_choice"], "request.parameters.tool_choice")
 
     def test_explicit_empty_tools_are_preserved_as_request_metadata(self) -> None:
         req = predict_v2_pb2.ModelInferRequest()
@@ -179,7 +179,7 @@ class DashScGrpcRequestTest(TestCase):
         self.assertIn("tools", controls)
         self.assertEqual(controls["tools"], [])
         self.assertEqual(controls["tool_choice"], "auto")
-        self.assertEqual(sources["tools"], "parameters")
+        self.assertEqual(sources["tools"], "request.parameters.tools")
 
     def test_parse_pretokenized_chat_controls_from_dashscope_payload(self) -> None:
         req = predict_v2_pb2.ModelInferRequest()
@@ -216,9 +216,9 @@ class DashScGrpcRequestTest(TestCase):
         self.assertEqual(
             sources,
             {
-                "tools": "ds_header_attributes",
-                "tool_choice": "ds_header_attributes",
-                "parallel_tool_calls": "ds_header_attributes",
+                "tools": "request.parameters.ds_header_attributes.payload.parameters.tools",
+                "tool_choice": "request.parameters.ds_header_attributes.payload.parameters.tool_choice",
+                "parallel_tool_calls": "request.parameters.ds_header_attributes.payload.parameters.parallel_tool_calls",
             },
         )
 
@@ -253,8 +253,11 @@ class DashScGrpcRequestTest(TestCase):
 
         self.assertEqual(controls["tool_choice"], "required")
         self.assertEqual(controls["tools"][0]["function"]["name"], "bash")
-        self.assertEqual(sources["tools"], "parameters")
-        self.assertEqual(sources["tool_choice"], "payload")
+        self.assertEqual(sources["tools"], "request.parameters.tools")
+        self.assertEqual(
+            sources["tool_choice"],
+            "request.parameters.payload.parameters.tool_choice",
+        )
 
     def test_pretokenized_controls_accept_top_level_payload_shape(self) -> None:
         req = predict_v2_pb2.ModelInferRequest()
@@ -429,6 +432,10 @@ class DashScGrpcRequestTest(TestCase):
             json.loads(config.structural_tag),
             {"format": normalized_response_format["format"]},
         )
+        self.assertEqual(sp.structural_tag_source, "request.parameters.response_format")
+        self.assertEqual(
+            sp.structural_tag_raw, json.dumps(response_format, ensure_ascii=False)
+        )
 
     def test_parse_sampling_response_format_array_compat(self) -> None:
         cases = [
@@ -582,13 +589,31 @@ class DashScGrpcRequestTest(TestCase):
             tag, ensure_ascii=False
         )
 
-        sp = parse_sampling_params(req)
+        with self.assertLogs(level="INFO") as captured:
+            sp = parse_sampling_params(req)
         config = sp.to_generate_config()
 
         self.assertEqual(json.loads(sp.structural_tag), tag)
+        self.assertEqual(
+            sp.structural_tag_source,
+            "request.parameters.tool_call_structural_tag",
+        )
+        self.assertEqual(sp.structural_tag_raw, json.dumps(tag, ensure_ascii=False))
         self.assertEqual(json.loads(config.structural_tag), tag)
         self.assertIsNone(config.response_format)
         self.assertFalse(config.json_format)
+        wire_logs = [line for line in captured.output if "[grammar-wire]" in line]
+        self.assertEqual(len(wire_logs), 1)
+        diagnostic = json.loads(wire_logs[0].split("[grammar-wire] ", 1)[1])
+        self.assertEqual(
+            diagnostic["structural_tag"]["source"],
+            "request.parameters.tool_call_structural_tag",
+        )
+        self.assertEqual(
+            diagnostic["structural_tag"]["raw_wire_value"],
+            json.dumps(tag, ensure_ascii=False),
+        )
+        self.assertEqual(diagnostic["structural_tag"]["parsed_value"], tag)
 
     def test_parse_sampling_normalizes_dashscope_sequence_structural_tag(self) -> None:
         tag = _dashscope_sequence_tool_call_structural_tag()
@@ -726,6 +751,11 @@ class DashScGrpcRequestTest(TestCase):
 
         sp = parse_sampling_params(req)
         self.assertEqual(json.loads(sp.structural_tag), tag)
+        self.assertEqual(
+            sp.structural_tag_source,
+            "request.parameters.ds_header_attributes.parameters.structural_tag",
+        )
+        self.assertEqual(sp.structural_tag_raw, tag)
 
         req = predict_v2_pb2.ModelInferRequest()
         req.parameters["structural_tag"].string_param = json.dumps(
@@ -733,6 +763,7 @@ class DashScGrpcRequestTest(TestCase):
         )
         sp = parse_sampling_params(req)
         self.assertEqual(json.loads(sp.to_generate_config().structural_tag), tag)
+        self.assertEqual(sp.structural_tag_source, "request.parameters.structural_tag")
 
     def test_build_model_infer_request_carries_tool_call_structural_tag(self) -> None:
         tag = _tool_call_structural_tag()

@@ -50,6 +50,68 @@ struct PretokenizedChatConstraints {
 
 std::shared_ptr<const PretokenizedChatConstraints> g_pretokenized_chat_constraints;
 
+const char* logitsProcessorName(const BaseLogitsProcessorPtr& processor) {
+    if (std::dynamic_pointer_cast<CompletionBoundaryLogitsProcessor>(processor)) {
+        return "CompletionBoundaryLogitsProcessor";
+    }
+    if (std::dynamic_pointer_cast<GrammarLogitsProcessor>(processor)) {
+        return "GrammarLogitsProcessor";
+    }
+    if (std::dynamic_pointer_cast<ReasoningGrammarLogitsProcessor>(processor)) {
+        return "ReasoningGrammarLogitsProcessor";
+    }
+    if (std::dynamic_pointer_cast<ThinkModeLogitsProcessor>(processor)) {
+        return "ThinkModeLogitsProcessor";
+    }
+    if (std::dynamic_pointer_cast<TreeLogitsProcessor>(processor)) {
+        return "TreeLogitsProcessor";
+    }
+    if (std::dynamic_pointer_cast<MultiSeqLogitsProcessor>(processor)) {
+        return "MultiSeqLogitsProcessor";
+    }
+    return "Unknown";
+}
+
+void logSelectedProcessors(const GenerateInput&                       generate_input,
+                           const std::vector<BaseLogitsProcessorPtr>& processors,
+                           const std::string&                         grammar_source,
+                           const GrammarKeyCpp&                       grammar_key) {
+    JsonArray processor_names;
+    for (const auto& processor : processors) {
+        processor_names.emplace_back(autil::legacy::Any(std::string(logitsProcessorName(processor))));
+    }
+
+    const auto& config = *generate_input.generate_config;
+    JsonMap     diagnostics;
+    diagnostics["request_id"]             = generate_input.request_id;
+    diagnostics["trace_id"]               = config.trace_id;
+    diagnostics["processors"]             = processor_names;
+    diagnostics["grammar_source"]         = grammar_source;
+    diagnostics["grammar_key_type"]       = grammar_key.key_type;
+    diagnostics["in_think_mode"]          = config.in_think_mode;
+    diagnostics["structural_tag_present"] = config.structural_tag.has_value();
+    if (config.structural_tag.has_value()) {
+        diagnostics["structural_tag"] = config.structural_tag.value();
+    }
+    if (config.response_format.has_value()) {
+        diagnostics["response_format"] = config.response_format.value();
+    }
+    if (config.json_schema.has_value()) {
+        diagnostics["json_schema"] = config.json_schema.value();
+    }
+    if (config.regex.has_value()) {
+        diagnostics["regex"] = config.regex.value();
+    }
+    if (config.ebnf.has_value()) {
+        diagnostics["ebnf"] = config.ebnf.value();
+    }
+    if (grammar_key.key_type != "structural_tag") {
+        diagnostics["grammar_key_string"] = grammar_key.key_string;
+    }
+    const auto serialized = autil::legacy::json::ToString(autil::legacy::Any(diagnostics), true);
+    RTP_LLM_LOG_INFO("[logits-processor] %s", serialized.c_str());
+}
+
 bool inputEndsWith(const torch::Tensor& input_ids, const std::vector<int32_t>& suffix) {
     if (suffix.empty() || !input_ids.defined() || !input_ids.device().is_cpu()
         || input_ids.scalar_type() != torch::kInt32 || input_ids.numel() < static_cast<int64_t>(suffix.size())) {
@@ -456,14 +518,21 @@ LogitsProcessorFactory::createLogitsProcessors(std::shared_ptr<GenerateInput> ge
     auto pretokenized_defaults = std::atomic_load_explicit(&g_pretokenized_chat_constraints, std::memory_order_acquire);
 
     GrammarKeyCpp                         grammar_key;
+    std::string                           grammar_source = "none";
     std::optional<CompletionBoundarySpec> completion_boundary_spec;
     try {
         grammar_key = keyFromGenerateConfig(*config);
+        if (!grammar_key.empty()) {
+            grammar_source = "incoming_generate_config";
+        }
         if (grammar_key.empty()) {
             if (pretokenized_defaults) {
                 completion_boundary_spec = applyPretokenizedChatConstraint(*generate_input, *pretokenized_defaults);
                 if (config->structural_tag.has_value()) {
-                    grammar_key = {"structural_tag", config->structural_tag.value()};
+                    grammar_key    = {"structural_tag", config->structural_tag.value()};
+                    grammar_source = "cpp_pretokenized_default_structural_tag";
+                } else if (completion_boundary_spec.has_value()) {
+                    grammar_source = "cpp_pretokenized_completion_boundary";
                 }
             }
         }
@@ -473,6 +542,7 @@ LogitsProcessorFactory::createLogitsProcessors(std::shared_ptr<GenerateInput> ge
                 ErrorCode::INVALID_PARAMS, std::string("invalid grammar response_format: ") + e.what(), false);
         }
         appendTreeAndMultiSeqProcessors(result, generate_input, init_batch_size, eos_token_id);
+        logSelectedProcessors(*generate_input, result, "invalid_incoming_generate_config", grammar_key);
         return result;
     }
 
@@ -510,6 +580,7 @@ LogitsProcessorFactory::createLogitsProcessors(std::shared_ptr<GenerateInput> ge
     }
 
     appendTreeAndMultiSeqProcessors(result, generate_input, init_batch_size, eos_token_id);
+    logSelectedProcessors(*generate_input, result, grammar_source, grammar_key);
     return result;
 }
 

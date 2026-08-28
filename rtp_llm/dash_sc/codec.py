@@ -333,27 +333,31 @@ def parse_pretokenized_chat_controls_with_sources(
     for name in PRETOKENIZED_CHAT_CONTROL_NAMES:
         value = _parse_pretokenized_chat_parameter(request, name)
         if value is not None:
-            sources[name] = "parameters"
+            sources[name] = f"request.parameters.{name}"
         else:
-            value = _lookup_ds_request_control(attrs, name)
+            value, source = _lookup_ds_request_control_with_source(attrs, name)
             if value is not None:
-                sources[name] = "ds_header_attributes"
+                sources[name] = str(source)
         if value is not None:
             controls[name] = _decode_pretokenized_chat_control(value)
 
     if all(name in controls for name in PRETOKENIZED_CHAT_CONTROL_NAMES):
         return controls, sources
 
-    payload = _load_multimodal_payload(request)
+    payload, payload_parameter_name = _load_multimodal_payload_with_source(request)
     if not isinstance(payload, dict):
         return controls, sources
     for name in PRETOKENIZED_CHAT_CONTROL_NAMES:
         if name in controls:
             continue
-        value = _lookup_ds_request_control(payload, name)
+        value, source = _lookup_ds_request_control_with_source(
+            payload,
+            name,
+            f"request.parameters.{payload_parameter_name}",
+        )
         if value is not None:
             controls[name] = _decode_pretokenized_chat_control(value)
-            sources[name] = "payload"
+            sources[name] = str(source)
     return controls, sources
 
 
@@ -404,9 +408,19 @@ def _nested_get_case_insensitive(value: Any, path: tuple[str, ...]) -> Any:
 
 def _lookup_ds_request_control(attrs: dict[str, Any], name: str) -> Any:
     """Find a Dash request control in common ds_header_attributes layouts."""
+    value, _ = _lookup_ds_request_control_with_source(attrs, name)
+    return value
+
+
+def _lookup_ds_request_control_with_source(
+    attrs: dict[str, Any],
+    name: str,
+    source_root: str = "request.parameters.ds_header_attributes",
+) -> tuple[Any, str | None]:
+    """Find a Dash request control and report its exact logical wire path."""
     direct = _dict_get_case_insensitive(attrs, name)
     if direct is not None:
-        return direct
+        return direct, f"{source_root}.{name}"
     for prefix in (
         ("parameters",),
         ("body",),
@@ -418,8 +432,9 @@ def _lookup_ds_request_control(attrs: dict[str, Any], name: str) -> Any:
     ):
         value = _nested_get_case_insensitive(attrs, prefix + (name,))
         if value is not None:
-            return value
-    return None
+            path = ".".join((source_root, *prefix, name))
+            return value, path
+    return None, None
 
 
 def _is_openai_compatible_request(
@@ -575,27 +590,61 @@ def _decode_structural_tag_payload(
     return adapt_dashscope_tool_call_wrapper_to_tag(value)
 
 
-def _parse_grammar_controls(
-    request, ds_attrs: dict[str, Any] | None = None
-) -> tuple[str | None, bool, str | None]:
-    response_format = _parse_optional_parameter_string(request, "response_format")
-    guided_json = _parse_optional_parameter_string(request, "guided_json")
+def _parse_grammar_controls(request, ds_attrs: dict[str, Any] | None = None) -> tuple[
+    str | None,
+    bool,
+    str | None,
+    str | None,
+    Any,
+    str | None,
+    Any,
+]:
+    raw_response_format = _parse_optional_parameter_string(request, "response_format")
+    response_format_source = (
+        "request.parameters.response_format"
+        if raw_response_format is not None
+        else None
+    )
+    raw_guided_json = _parse_optional_parameter_string(request, "guided_json")
+    guided_json_source = (
+        "request.parameters.guided_json" if raw_guided_json is not None else None
+    )
     json_format_value = _parse_optional_parameter_bool(request, "json_format")
     ds_attrs = ds_attrs if ds_attrs is not None else parse_ds_header_attributes(request)
 
-    response_format = _parse_response_format_value(response_format)
+    response_format = _parse_response_format_value(raw_response_format)
     if response_format is None:
-        response_format = _parse_response_format_value(
-            _lookup_ds_request_control(ds_attrs, "response_format")
+        nested_response_format_raw, nested_response_format_source = (
+            _lookup_ds_request_control_with_source(ds_attrs, "response_format")
         )
+        nested_response_format = _parse_response_format_value(
+            nested_response_format_raw
+        )
+        if nested_response_format is not None:
+            raw_response_format = nested_response_format_raw
+            response_format_source = nested_response_format_source
+            response_format = nested_response_format
 
-    guided_response_format = _parse_guided_json_response_format(guided_json)
+    guided_response_format = _parse_guided_json_response_format(raw_guided_json)
     if guided_response_format is None:
-        guided_response_format = _parse_guided_json_response_format(
-            _lookup_ds_request_control(ds_attrs, "guided_json")
+        nested_guided_json, nested_guided_json_source = (
+            _lookup_ds_request_control_with_source(ds_attrs, "guided_json")
         )
+        nested_guided_response_format = _parse_guided_json_response_format(
+            nested_guided_json
+        )
+        if nested_guided_response_format is not None:
+            raw_guided_json = nested_guided_json
+            guided_json_source = nested_guided_json_source
+            guided_response_format = nested_guided_response_format
     if guided_response_format is not None:
         response_format = guided_response_format
+        raw_response_format = raw_guided_json
+        response_format_source = guided_json_source
+
+    if response_format is None:
+        response_format_source = None
+        raw_response_format = None
 
     if json_format_value is None:
         json_format_value = _parse_optional_bool(
@@ -605,17 +654,30 @@ def _parse_grammar_controls(
     raw_structural_tag = _parse_optional_parameter_string(
         request, "tool_call_structural_tag"
     )
+    structural_tag_source = (
+        "request.parameters.tool_call_structural_tag"
+        if raw_structural_tag is not None
+        else None
+    )
+    structural_tag_field_name = "tool_call_structural_tag"
     if raw_structural_tag is None:
         raw_structural_tag = _parse_optional_parameter_string(request, "structural_tag")
+        if raw_structural_tag is not None:
+            structural_tag_source = "request.parameters.structural_tag"
+            structural_tag_field_name = "structural_tag"
     if raw_structural_tag is None:
-        raw_structural_tag = _lookup_ds_request_control(
-            ds_attrs, "tool_call_structural_tag"
+        raw_structural_tag, structural_tag_source = (
+            _lookup_ds_request_control_with_source(ds_attrs, "tool_call_structural_tag")
         )
     if raw_structural_tag is None:
-        raw_structural_tag = _lookup_ds_request_control(ds_attrs, "structural_tag")
+        raw_structural_tag, structural_tag_source = (
+            _lookup_ds_request_control_with_source(ds_attrs, "structural_tag")
+        )
+        if raw_structural_tag is not None:
+            structural_tag_field_name = "structural_tag"
 
     structural_tag = _decode_structural_tag_payload(
-        raw_structural_tag, "tool_call_structural_tag"
+        raw_structural_tag, structural_tag_field_name
     )
 
     if isinstance(response_format, dict):
@@ -631,12 +693,18 @@ def _parse_grammar_controls(
             )
             if structural_tag is None:
                 structural_tag = response_structural_tag
+                structural_tag_source = response_format_source
+                raw_structural_tag = raw_response_format
             response_format = None
 
     return (
         _jsonable_to_string(response_format),
         bool(json_format_value),
         _jsonable_to_string(structural_tag),
+        response_format_source,
+        raw_response_format,
+        structural_tag_source,
+        raw_structural_tag,
     )
 
 
@@ -756,6 +824,10 @@ class SamplingParams:
     response_format: str | None = None
     json_format: bool = False
     structural_tag: str | None = None
+    response_format_source: str | None = field(default=None, repr=False, compare=False)
+    response_format_raw: Any = field(default=None, repr=False, compare=False)
+    structural_tag_source: str | None = field(default=None, repr=False, compare=False)
+    structural_tag_raw: Any = field(default=None, repr=False, compare=False)
 
     @property
     def n(self) -> int:
@@ -914,11 +986,17 @@ def parse_sampling_params(
     if sw is not None:
         stop_words_list = sw
 
-    response_format, json_format, structural_tag = _parse_grammar_controls(
-        request, ds_attrs
-    )
+    (
+        response_format,
+        json_format,
+        structural_tag,
+        response_format_source,
+        response_format_raw,
+        structural_tag_source,
+        structural_tag_raw,
+    ) = _parse_grammar_controls(request, ds_attrs)
 
-    return SamplingParams(
+    sampling = SamplingParams(
         max_new_tokens=max_new_tokens,
         max_new_tokens_from_completion_alias=max_new_tokens_from_completion_alias,
         max_total_tokens=max_total_tokens,
@@ -936,6 +1014,49 @@ def parse_sampling_params(
         response_format=response_format,
         json_format=json_format,
         structural_tag=structural_tag,
+        response_format_source=response_format_source,
+        response_format_raw=response_format_raw,
+        structural_tag_source=structural_tag_source,
+        structural_tag_raw=structural_tag_raw,
+    )
+    _log_grammar_wire(request, sampling)
+    return sampling
+
+
+def _log_grammar_wire(request: Any, sampling: SamplingParams) -> None:
+    """Log the exact grammar-related values observed by the DashSc codec."""
+
+    def parsed(value: str | None) -> Any:
+        if value is None:
+            return None
+        try:
+            return json.loads(value)
+        except (TypeError, ValueError):
+            return value
+
+    diagnostic = {
+        "request_id": str(getattr(request, "id", "")),
+        "request_parameter_fields": sorted(str(key) for key in request.parameters),
+        "response_format": {
+            "source": sampling.response_format_source,
+            "raw_wire_value": sampling.response_format_raw,
+            "parsed_value": parsed(sampling.response_format),
+        },
+        "structural_tag": {
+            "source": sampling.structural_tag_source,
+            "raw_wire_value": sampling.structural_tag_raw,
+            "parsed_value": parsed(sampling.structural_tag),
+        },
+        "json_format": sampling.json_format,
+    }
+    logging.info(
+        "[DashScGrpc] [grammar-wire] %s",
+        json.dumps(
+            diagnostic,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
     )
 
 
@@ -1243,6 +1364,12 @@ def _load_multimodal_payload(request) -> Any:
     ``None`` when neither is present / both are empty / JSON decoding fails.
     Fail-open on JSON errors — caller will treat ``None`` as "no multimodal".
     """
+    payload, _ = _load_multimodal_payload_with_source(request)
+    return payload
+
+
+def _load_multimodal_payload_with_source(request) -> tuple[Any, str | None]:
+    """Return the decoded body and the request.parameters key that carried it."""
     for key in _MULTIMODAL_PARAMETER_KEYS:
         if key not in request.parameters:
             continue
@@ -1250,15 +1377,15 @@ def _load_multimodal_payload(request) -> Any:
         if not param.HasField("string_param") or not param.string_param:
             continue
         try:
-            return json.loads(param.string_param)
+            return json.loads(param.string_param), key
         except (TypeError, ValueError) as e:
             logging.warning(
                 "failed to parse multimodal payload JSON from parameters[%r]: %s",
                 key,
                 e,
             )
-            return None
-    return None
+            return None, key
+    return None, None
 
 
 def parse_multimodal_parts_from_request(request) -> list[MultimodalPart]:

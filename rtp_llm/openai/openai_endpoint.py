@@ -47,6 +47,98 @@ from rtp_llm.utils.complete_response_async_generator import (
 )
 
 _INT32_MAX = 2_147_483_647
+_LOGGED_TOOL_NAME_LIMIT = 20
+
+
+def _tool_names_for_log(tools: Any) -> List[str]:
+    names: List[str] = []
+    for tool in tools or []:
+        function = getattr(tool, "function", None)
+        if function is not None:
+            name = getattr(function, "name", None)
+        elif isinstance(tool, dict):
+            function_dict = tool.get("function")
+            name = (
+                function_dict.get("name") if isinstance(function_dict, dict) else None
+            )
+        else:
+            name = None
+        if name:
+            names.append(str(name))
+        if len(names) >= _LOGGED_TOOL_NAME_LIMIT:
+            break
+    return names
+
+
+def _tool_choice_for_log(tool_choice: Any) -> Optional[str]:
+    if tool_choice is None or isinstance(tool_choice, str):
+        return tool_choice
+    if isinstance(tool_choice, dict):
+        function = tool_choice.get("function")
+        if isinstance(function, dict) and function.get("name"):
+            return f"function:{function['name']}"
+        return str(tool_choice.get("type") or "object")
+    return type(tool_choice).__name__
+
+
+def _openai_request_parameter_summary(
+    chat_request: ChatCompletionRequest, raw_body: Any = None
+) -> dict[str, Any]:
+    """Summarize request controls without logging prompts or tool schemas."""
+    raw_body_fields = (
+        sorted(str(key) for key in raw_body) if isinstance(raw_body, dict) else []
+    )
+    request_tools = chat_request.tools or []
+    message_tools = [
+        tool
+        for message in chat_request.messages or []
+        for tool in (message.tools or [])
+    ]
+    extra_configs = chat_request.extra_configs
+    return {
+        "path": "openai",
+        "raw_body_fields": raw_body_fields,
+        "parsed_fields": sorted(str(key) for key in chat_request.model_fields_set),
+        "extra_config_fields": (
+            sorted(str(key) for key in extra_configs.model_fields_set)
+            if extra_configs is not None
+            else []
+        ),
+        "functions_count": len(chat_request.functions or []),
+        "tools_count": len(request_tools),
+        "tool_names": _tool_names_for_log(request_tools),
+        "message_tools_count": len(message_tools),
+        "message_tool_names": _tool_names_for_log(message_tools),
+        "tool_choice": _tool_choice_for_log(chat_request.tool_choice),
+        "parallel_tool_calls": chat_request.parallel_tool_calls,
+        "response_format_type": (
+            chat_request.response_format.type
+            if chat_request.response_format is not None
+            else None
+        ),
+        "structural_tag_in_extra_config": bool(
+            extra_configs is not None and extra_configs.structural_tag is not None
+        ),
+    }
+
+
+async def _log_openai_request_parameters(
+    request_id: int, chat_request: ChatCompletionRequest, raw_request: Request
+) -> None:
+    raw_body = None
+    try:
+        raw_body = await raw_request.json()
+    except Exception:
+        # The validated Pydantic model still tells us which known fields were
+        # explicitly supplied for non-JSON tests and custom ASGI wrappers.
+        pass
+    summary = _openai_request_parameter_summary(chat_request, raw_body)
+    summary["request_id"] = request_id
+    summary["trace_id"] = chat_request.trace_id or ""
+    logging.info(
+        "[request-params] %s",
+        json.dumps(summary, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+    )
 
 
 def _positive_int_or_none(value: Optional[int]) -> Optional[int]:
@@ -580,6 +672,7 @@ class OpenaiEndpoint(object):
     async def chat_completion_async(
         self, request_id: int, chat_request: ChatCompletionRequest, raw_request: Request
     ) -> CompleteResponseAsyncGenerator:
+        await _log_openai_request_parameters(request_id, chat_request, raw_request)
         renderer = (
             self.template_renderer if chat_request.user_template else self.chat_renderer
         )
