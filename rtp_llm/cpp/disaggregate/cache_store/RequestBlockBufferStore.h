@@ -5,6 +5,7 @@
 #include <atomic>
 #include <mutex>
 #include <functional>
+#include <optional>
 #include "rtp_llm/cpp/disaggregate/cache_store/RequestBlockBuffer.h"
 #include "rtp_llm/cpp/disaggregate/cache_store/MemoryUtil.h"
 
@@ -29,8 +30,9 @@ public:
 
     void delRequestBlockBuffer(const std::string& requestid);
 
-    std::string debugInfoOnRequest(const std::string& requestid) const;
-    void        debugInfo();
+    std::optional<RequestBlockBufferDebugInfo> getDebugInfoOnRequest(const std::string& requestid) const;
+    std::string                                debugInfoOnRequest(const std::string& requestid) const;
+    void                                       debugInfo();
 
     bool                         regUserBuffers(const std::vector<std::shared_ptr<BlockBuffer>>& buffers);
     std::shared_ptr<BlockBuffer> findUserBuffer(const std::string& buffer_key);

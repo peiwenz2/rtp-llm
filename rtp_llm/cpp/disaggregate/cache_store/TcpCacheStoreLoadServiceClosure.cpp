@@ -23,15 +23,21 @@ TcpCacheStoreLoadServiceClosure::~TcpCacheStoreLoadServiceClosure() {
 void TcpCacheStoreLoadServiceClosure::Run() {
     pinThreadToDeviceOnce(device_id_);
     collector_->markRequestCallEnd(currentTimeUs() - response_->response_send_start_time_us());
+    const auto request_id = request_ != nullptr ? request_->requestid() : "unknown";
+    request_block_buffer_->markClientRpcCompletion();
 
     if (controller_->Failed()) {
-        RTP_LLM_LOG_WARNING("cache load request failed, controller err is %d", controller_->GetErrorCode());
+        RTP_LLM_LOG_WARNING("cache load rpc completion received with controller failure, request %s, controller err %d",
+                            request_id.c_str(),
+                            controller_->GetErrorCode());
         end(false, CacheStoreUtil::fromArpcErrorCode(controller_->GetErrorCode()));
         return;
     }
 
     if (response_->error_code() != KvCacheStoreServiceErrorCode::EC_SUCCESS) {
-        RTP_LLM_LOG_WARNING("cache load request failed, response err is %d", response_->error_code());
+        RTP_LLM_LOG_WARNING("cache load rpc completion received with response failure, request %s, response err %d",
+                            request_id.c_str(),
+                            response_->error_code());
         end(false, CacheStoreUtil::fromKvCacheStoreErrorCode(response_->error_code()));
         return;
     }
@@ -69,7 +75,20 @@ void TcpCacheStoreLoadServiceClosure::Run() {
 
 void TcpCacheStoreLoadServiceClosure::end(bool success, CacheStoreErrorCode ec) {
     collector_->markEnd(success);
+    const auto request_id = request_ != nullptr ? request_->requestid() : "unknown";
+    if (!success) {
+        RTP_LLM_LOG_WARNING("cache load client callback begin, request %s, error %s",
+                            request_id.c_str(),
+                            CacheStoreErrorCodeToString(ec).c_str());
+    }
+    request_block_buffer_->markClientCallbackBegin();
     callback_(success, ec);
+    request_block_buffer_->markClientCallbackEnd();
+    if (!success) {
+        RTP_LLM_LOG_WARNING("cache load client callback end, request %s, error %s",
+                            request_id.c_str(),
+                            CacheStoreErrorCodeToString(ec).c_str());
+    }
     delete this;
 }
 

@@ -48,7 +48,10 @@ void TcpCacheStoreServiceImpl::loadTcpBlocks(const ::CacheLoadRequest*          
         return;
     }
 
-    auto timer_callback = [context]() { context->runFailed(KvCacheStoreServiceErrorCode::EC_FAILED_LOAD_BUFFER); };
+    auto timer_callback = [context]() {
+        context->runFailed(KvCacheStoreServiceErrorCode::EC_FAILED_LOAD_BUFFER,
+                           CacheLoadFailureSource::TIMER_EXPIRED);
+    };
 
     auto timer = timer_manager_->addTimer(request->timeout_ms(), std::move(timer_callback));
     if (timer == nullptr) {
@@ -64,15 +67,22 @@ void TcpCacheStoreServiceImpl::loadTcpBlocks(const ::CacheLoadRequest*          
 
     RequestBlockBuffer::WatchFunc watch_func = [context](bool                                             ok,
                                                          const std::vector<std::shared_ptr<BlockBuffer>>& blocks) {
+        context->markWatchCallbackBegin(blocks.size());
         context->loadBlockOnTcp(ok, blocks);
+        context->markWatchCallbackEnd();
     };
 
-    if (!request_block_buffer_store_->setRequestBlockBufferWatchFunc(request->requestid(), std::move(watch_func))) {
+    context->markWatchRegisterAttempt();
+    const auto watch_register_success =
+        request_block_buffer_store_->setRequestBlockBufferWatchFunc(request->requestid(), std::move(watch_func));
+    context->markWatchRegisterResult(watch_register_success);
+    if (!watch_register_success) {
         RTP_LLM_LOG_WARNING(
             "cache store service set request block buffer watch func failed, request id %s, request from %s",
             request->requestid().c_str(),
             request->client_ip().c_str());
-        context->runFailed(KvCacheStoreServiceErrorCode::EC_FAILED_LOAD_BUFFER);
+        context->runFailed(KvCacheStoreServiceErrorCode::EC_FAILED_LOAD_BUFFER,
+                           CacheLoadFailureSource::WATCH_REGISTRATION_FAILED);
     }
 }
 

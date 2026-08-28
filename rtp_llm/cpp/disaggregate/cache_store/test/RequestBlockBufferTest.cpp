@@ -112,6 +112,48 @@ TEST_F(RequestBlockBufferTest, testWatchFunc_SetWatchFunc) {
     }
 }
 
+TEST_F(RequestBlockBufferTest, testWatchFunc_DebugInfoTracksDispatchLifecycle) {
+    auto request_block_buffer = std::make_shared<RequestBlockBuffer>("request-1");
+    int  callback_count       = 0;
+    ASSERT_TRUE(request_block_buffer->setWatchFunc(
+        [&callback_count](bool ok, const std::vector<std::shared_ptr<BlockBuffer>>& blocks) {
+            ASSERT_TRUE(ok);
+            ASSERT_EQ(blocks.size(), 1);
+            ++callback_count;
+        }));
+
+    std::shared_ptr<void> buffer((void*)0x1, [](void*) {});
+    request_block_buffer->addBlock(std::make_shared<BlockBuffer>("b0", buffer, 1024, true, true));
+
+    const auto info = request_block_buffer->getDebugInfo();
+    EXPECT_EQ(callback_count, 1);
+    EXPECT_EQ(info.block_keys.size(), 1);
+    EXPECT_EQ(info.block_add_count, 1);
+    EXPECT_EQ(info.watch_func_count, 1);
+    EXPECT_EQ(info.watch_trigger_count, 1);
+    EXPECT_EQ(info.watch_callback_dispatch_count, 1);
+    EXPECT_EQ(info.watch_callback_complete_count, 1);
+    EXPECT_EQ(info.watch_callback_inflight_count, 0);
+    EXPECT_GT(info.last_block_add_time_us, 0);
+    EXPECT_GT(info.last_watch_register_time_us, 0);
+    EXPECT_GT(info.last_watch_trigger_time_us, 0);
+    EXPECT_GT(info.last_watch_callback_complete_time_us, 0);
+
+    request_block_buffer->markClientRpcCompletion();
+    request_block_buffer->markClientCallbackBegin();
+    auto inflight_info = request_block_buffer->getDebugInfo();
+    EXPECT_EQ(inflight_info.client_rpc_completion_count, 1);
+    EXPECT_EQ(inflight_info.client_callback_begin_count, 1);
+    EXPECT_EQ(inflight_info.client_callback_end_count, 0);
+    EXPECT_EQ(inflight_info.client_callback_inflight_count, 1);
+    request_block_buffer->markClientCallbackEnd();
+    const auto completed_info = request_block_buffer->getDebugInfo();
+    EXPECT_EQ(completed_info.client_callback_end_count, 1);
+    EXPECT_EQ(completed_info.client_callback_inflight_count, 0);
+    EXPECT_GT(completed_info.last_client_rpc_completion_time_us, 0);
+    EXPECT_GT(completed_info.last_client_callback_time_us, 0);
+}
+
 TEST_F(RequestBlockBufferTest, testWatchFunc_AddBlock) {
     bool                                      watched_called1{false};
     bool                                      watched_success1{false};

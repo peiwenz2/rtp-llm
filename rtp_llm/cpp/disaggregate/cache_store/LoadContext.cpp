@@ -3,6 +3,8 @@
 #include "rtp_llm/cpp/disaggregate/cache_store/CacheStore.h"
 #include "rtp_llm/cpp/disaggregate/cache_store/ErrorCodeUtil.h"
 #include "rtp_llm/cpp/utils/Logger.h"
+#include "rtp_llm/cpp/utils/TimeUtil.h"
+#include <sstream>
 
 namespace rtp_llm {
 
@@ -41,6 +43,8 @@ void SyncContext::call(const std::vector<std::shared_ptr<RequestBlockBuffer>>& r
     }
 
     expect_layer_cnt_ = request_block_buffers_.size();
+    completed_request_buffers_.clear();
+    duplicate_completion_count_ = 0;
 
     for (auto& request_block_buffer : request_block_buffers_) {
         if (!doCall(request_block_buffer, timeout_ms)) {
@@ -53,14 +57,23 @@ void SyncContext::updateResult(bool                                       succes
                                CacheStoreErrorCode                        ec,
                                const std::shared_ptr<RequestBlockBuffer>& request_block_buffer) {
     std::lock_guard<std::mutex> lock(mutex_);
+    const auto completion_inserted = completed_request_buffers_.insert(request_block_buffer.get()).second;
+    if (!completion_inserted) {
+        ++duplicate_completion_count_;
+    }
+    const auto done_layer_count = ++done_layer_cnt_;
     if (!success) {
         auto error_code = transCacheStoreErrorCode(ec);
         error_info_     = ErrorInfo(error_code, ErrorCodeToString(error_code));
-        RTP_LLM_LOG_WARNING("request %s call finished, state:[%s], error code[%s], cost time %ldms",
+        RTP_LLM_LOG_WARNING("request %s call finished, state:[%s], error code[%s], cost time %ldms, completion "
+                            "progress %d/%d, duplicate completion %d",
                             request_block_buffer->getRequestKey().c_str(),
                             success ? "success" : "failed",
                             CacheStoreErrorCodeToString(ec).c_str(),
-                            autil::TimeUtility::currentTimeInMilliSeconds() - start_time_ms_);
+                            autil::TimeUtility::currentTimeInMilliSeconds() - start_time_ms_,
+                            done_layer_count,
+                            expect_layer_cnt_,
+                            !completion_inserted);
     } else {
         RTP_LLM_LOG_DEBUG("request %s call finished, state:[%s], cost time %ldms",
                           request_block_buffer->getRequestKey().c_str(),
@@ -68,9 +81,53 @@ void SyncContext::updateResult(bool                                       succes
                           autil::TimeUtility::currentTimeInMilliSeconds() - start_time_ms_);
     }
 
-    if (++done_layer_cnt_ == expect_layer_cnt_) {
+    if (done_layer_count == expect_layer_cnt_) {
         cond_.notify_all();
     }
+}
+
+std::string SyncContext::getPendingRequestsDebugInfoLocked() const {
+    constexpr size_t kMaxPendingRequestSamples = 16;
+    constexpr size_t kMaxRequestKeyLength       = 128;
+    const auto       now_us                     = currentTimeUs();
+    std::ostringstream stream;
+    size_t             pending_count = 0;
+    size_t             sampled_count = 0;
+    stream << "{done_layers=" << done_layer_cnt_.load() << ", expected_layers=" << expect_layer_cnt_
+           << ", duplicate_completions=" << duplicate_completion_count_ << ", sample_pending_request_keys=[";
+    for (const auto& request_block_buffer : request_block_buffers_) {
+        if (completed_request_buffers_.find(request_block_buffer.get()) != completed_request_buffers_.end()) {
+            continue;
+        }
+        ++pending_count;
+        if (sampled_count >= kMaxPendingRequestSamples) {
+            continue;
+        }
+        if (sampled_count++ > 0) {
+            stream << ",";
+        }
+        const auto& request_key = request_block_buffer->getRequestKey();
+        if (request_key.size() <= kMaxRequestKeyLength) {
+            stream << request_key;
+        } else {
+            stream << request_key.substr(0, kMaxRequestKeyLength - 3) << "...";
+        }
+        const auto info = request_block_buffer->getDebugInfo();
+        stream << "{rpc_completion=" << info.client_rpc_completion_count
+               << ", callback_begin=" << info.client_callback_begin_count
+               << ", callback_end=" << info.client_callback_end_count
+               << ", callback_inflight=" << info.client_callback_inflight_count
+               << ", last_rpc_completion_age_ms="
+               << (info.last_client_rpc_completion_time_us > 0
+                       ? (now_us - info.last_client_rpc_completion_time_us) / 1000
+                       : -1)
+               << ", last_callback_age_ms="
+               << (info.last_client_callback_time_us > 0 ? (now_us - info.last_client_callback_time_us) / 1000 : -1)
+               << "}";
+    }
+    stream << "], pending_layers=" << pending_count
+           << ", omitted_pending_request_keys=" << pending_count - sampled_count << "}";
+    return stream.str();
 }
 
 void SyncContext::waitDone() {
@@ -84,7 +141,8 @@ void SyncContext::waitDone() {
         if (autil::TimeUtility::currentTimeInMilliSeconds() >= deadline_ms_) {
             auto error_code = ErrorCode::CACHE_STORE_LOAD_BUFFER_TIMEOUT;
             error_info_     = ErrorInfo(error_code, ErrorCodeToString(error_code));
-            RTP_LLM_LOG_INFO("load context wait done on timeout");
+            RTP_LLM_LOG_WARNING("load context wait done on timeout, completion progress is %s",
+                                getPendingRequestsDebugInfoLocked().c_str());
             return;
         }
 

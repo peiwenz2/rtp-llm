@@ -1,5 +1,6 @@
 #include "rtp_llm/cpp/disaggregate/cache_store/TcpCacheStoreServiceImplContext.h"
 #include "rtp_llm/cpp/utils/Logger.h"
+#include "rtp_llm/cpp/utils/TimeUtil.h"
 
 namespace rtp_llm {
 
@@ -11,7 +12,8 @@ void TcpCacheStoreServiceImplContext::loadBlockOnTcp(bool ok, const std::vector<
 
     if (!ok) {
         // request been canceled in cache store, just failed
-        runFailed(KvCacheStoreServiceErrorCode::EC_FAILED_LOAD_BUFFER);
+        runFailed(KvCacheStoreServiceErrorCode::EC_FAILED_LOAD_BUFFER,
+                  CacheLoadFailureSource::REQUEST_BLOCK_BUFFER_CLOSED);
         return;
     }
 
@@ -29,15 +31,17 @@ void TcpCacheStoreServiceImplContext::loadBlockOnTcp(bool ok, const std::vector<
                 unloaded_block_info->len(),
                 block->len / partition_count_,
                 peer_ip_.c_str());
-            runFailed(KvCacheStoreServiceErrorCode::EC_FAILED_INVALID_REQ);
+            runFailed(KvCacheStoreServiceErrorCode::EC_FAILED_INVALID_REQ, CacheLoadFailureSource::INVALID_BLOCK);
             return;
         }
 
         if (!writeResponseBlock(block, unloaded_block_info)) {
-            runFailed(KvCacheStoreServiceErrorCode::EC_FAILED_INTERNAL);
+            runFailed(KvCacheStoreServiceErrorCode::EC_FAILED_INTERNAL,
+                      CacheLoadFailureSource::RESPONSE_WRITE_FAILED);
             return;
         }
         ++write_cnt_;
+        last_response_write_time_us_ = currentTimeUs();
     }
 
     if (write_cnt_ == total_block_count_) {

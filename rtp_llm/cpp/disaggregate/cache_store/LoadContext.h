@@ -1,9 +1,12 @@
 #pragma once
 
 #include <condition_variable>
+#include <cstdint>
 #include <mutex>
 #include <memory>
 #include <functional>
+#include <string>
+#include <unordered_set>
 #include <vector>
 #include <atomic>
 
@@ -36,6 +39,7 @@ public:
 
 protected:
     virtual bool doCall(const std::shared_ptr<RequestBlockBuffer>& request_block_buffer, int64_t timeout_ms) = 0;
+    std::string  getPendingRequestsDebugInfoLocked() const;
 
 protected:
     std::weak_ptr<CacheStore> cache_store_;
@@ -52,6 +56,8 @@ protected:
     std::condition_variable cond_;
     int                     expect_layer_cnt_ = 0;
     std::atomic_int         done_layer_cnt_   = 0;
+    std::unordered_set<const RequestBlockBuffer*> completed_request_buffers_;
+    uint64_t                                      duplicate_completion_count_{0};
 };
 
 class LoadContext: public SyncContext {

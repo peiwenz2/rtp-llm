@@ -30,7 +30,7 @@ public:
 class TcpCacheStoreServiceImplContextTest: public CacheStoreTestBase {
 protected:
     bool initCacheStores();
-    bool initContext();
+    bool initContext(bool add_duplicate_block = false);
     void loadThreadFunction(int id);
     void storeBlocks(int num);
     void verifyContextRunDone(int                          unloaded_block_cnt,
@@ -89,7 +89,7 @@ bool TcpCacheStoreServiceImplContextTest::initCacheStores() {
     cache_store2_ = NormalCacheStore::createNormalCacheStore(params2);
     return cache_store2_ != nullptr;
 }
-bool TcpCacheStoreServiceImplContextTest::initContext() {
+bool TcpCacheStoreServiceImplContextTest::initContext(bool add_duplicate_block) {
     auto request_block_buffer = std::make_shared<RequestBlockBuffer>("request-1");
     for (int i = 0; i < 10; i++) {
         auto block = block_buffer_util_->makeBlockBuffer("b" + std::to_string(i), 1024, '0' + i, true);
@@ -102,6 +102,9 @@ bool TcpCacheStoreServiceImplContextTest::initContext() {
     request_ = cache_store1_->messager_->makeLoadRequest(load_request);
     if (request_ == nullptr) {
         return false;
+    }
+    if (add_duplicate_block) {
+        request_->add_blocks()->CopyFrom(request_->blocks(0));
     }
 
     arpc::ANetRPCController* controller = new arpc::ANetRPCController();
@@ -228,6 +231,51 @@ TEST_F(TcpCacheStoreServiceImplContextTest, loadBlock_Timeout) {
     mutex.unlock();
 
     verifyContextRunDone(3, 7, true, KvCacheStoreServiceErrorCode::EC_FAILED_LOAD_BUFFER);
+    const auto progress = context_->getLoadProgressDebugInfo();
+    EXPECT_THAT(progress, testing::HasSubstr("total=10, unique_expected=10, duplicate_request_keys=0"));
+    EXPECT_THAT(progress, testing::HasSubstr("ready=7, remaining_unloaded=3, write_done=7, pending_write=0"));
+}
+
+TEST_F(TcpCacheStoreServiceImplContextTest, loadProgressDebugInfo_DuplicateKeys) {
+    ASSERT_TRUE(initCacheStores());
+    ASSERT_TRUE(initContext(true));
+
+    const auto progress = context_->getLoadProgressDebugInfo();
+    EXPECT_THAT(progress, testing::HasSubstr("total=11, unique_expected=10, duplicate_request_keys=1"));
+    EXPECT_THAT(progress, testing::HasSubstr("sample_duplicate_keys=[b0]"));
+
+    EXPECT_CALL(*done_, Run()).Times(1);
+    context_->runFailed(KvCacheStoreServiceErrorCode::EC_FAILED_LOAD_BUFFER,
+                        CacheLoadFailureSource::TIMER_EXPIRED);
+    EXPECT_THAT(context_->getLoadProgressDebugInfo(), testing::HasSubstr("failure_source=timer_expired"));
+}
+
+TEST_F(TcpCacheStoreServiceImplContextTest, loadProgressDebugInfo_DistinguishesMissingAndUndeliveredKeys) {
+    ASSERT_TRUE(initCacheStores());
+    ASSERT_TRUE(initContext());
+
+    auto stored = std::make_shared<RequestBlockBuffer>("request-1");
+    for (int i = 0; i < 9; ++i) {
+        stored->addBlock(block_buffer_util_->makeBlockBuffer("b" + std::to_string(i), 1024, '0' + i, true));
+    }
+    stored->addBlock(block_buffer_util_->makeBlockBuffer("unexpected", 1024, 'x', true));
+    cache_store1_->request_block_buffer_store_->request_cache_map_["request-1"] = stored;
+
+    context_->markWatchRegisterAttempt();
+    context_->markWatchRegisterResult(true);
+    context_->markWatchCallbackBegin(2);
+    context_->markWatchCallbackEnd();
+
+    const auto progress = context_->getLoadProgressDebugInfo();
+    EXPECT_THAT(progress, testing::HasSubstr("block_buffer_found=1"));
+    EXPECT_THAT(progress, testing::HasSubstr("stored_unique=10"));
+    EXPECT_THAT(progress, testing::HasSubstr("missing_in_store_count=1"));
+    EXPECT_THAT(progress, testing::HasSubstr("sample_missing_in_store_keys=[b9]"));
+    EXPECT_THAT(progress, testing::HasSubstr("present_but_unconsumed_count=9"));
+    EXPECT_THAT(progress, testing::HasSubstr("unexpected_in_store_count=1"));
+    EXPECT_THAT(progress, testing::HasSubstr("sample_unexpected_in_store_keys=[unexpected]"));
+    EXPECT_THAT(progress, testing::HasSubstr("context_watch_callback_enter=1"));
+    EXPECT_THAT(progress, testing::HasSubstr("context_watch_callback_exit=1"));
 }
 
 TEST_F(TcpCacheStoreServiceImplContextTest, loadBlock_Canceled) {

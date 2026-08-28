@@ -1261,6 +1261,27 @@ ErrorInfo DecodeRpcServer::loadCache(const LoadKVCacheContext& load_context) {
                                         block.addr != nullptr, "null block addr for key=%s", key.c_str());
                                     RTP_LLM_CHECK_WITH_INFO(
                                         block.size_bytes > 0, "zero block size for key=%s", key.c_str());
+                                    if (maga_init_params_.parallelism_config.tp_rank == 0) {
+                                        RTP_LLM_LOG_INFO(
+                                            "[cache-load-expected] request_id=%ld peer_index=%d peer_addr=%s "
+                                            "model_id=%zu local_layer_id=%zu global_layer_id=%d group_id=%zu "
+                                            "physical_group_id=%d group_type=%d region=%d block_pos=%zu "
+                                            "cache_key_index=%zu block_id=%d transfer_key=%s",
+                                            load_context.request_id,
+                                            i,
+                                            peer_addr.c_str(),
+                                            model_id,
+                                            layer_id,
+                                            global_layer_id,
+                                            gid,
+                                            physical_gid,
+                                            static_cast<int>(group_type),
+                                            static_cast<int>(region_name),
+                                            block_pos,
+                                            cache_key_index,
+                                            block_id,
+                                            key.c_str());
+                                    }
                                     std::shared_ptr<void> addr(block.addr, [](void*) {});
                                     load_layer_cache->addBlock(
                                         key, addr, static_cast<uint32_t>(block.size_bytes), block.is_cuda, true);

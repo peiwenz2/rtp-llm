@@ -81,13 +81,28 @@ void RequestBlockBufferStore::debugInfo() {
 }
 
 std::string RequestBlockBufferStore::debugInfoOnRequest(const std::string& requestid) const {
-    std::ostringstream stream;
-    auto               request_block_buffer = getRequestBlockBuffer(requestid);
-    if (request_block_buffer == nullptr) {
-        stream << "request id: " << requestid << " not found or expired";
-        return stream.str();
+    auto request_block_buffer_debug_info = getDebugInfoOnRequest(requestid);
+    if (!request_block_buffer_debug_info.has_value()) {
+        return "request id: " + requestid + " not found or expired";
     }
-    return request_block_buffer->debugInfo();
+    const auto& info = request_block_buffer_debug_info.value();
+    std::ostringstream stream;
+    stream << "request id: " << requestid << ", blocks count: " << info.block_keys.size()
+           << ", block adds: " << info.block_add_count << ", watch funcs: " << info.watch_func_count
+           << ", watch triggers: " << info.watch_trigger_count
+           << ", watch callback dispatches: " << info.watch_callback_dispatch_count
+           << ", watch callback completes: " << info.watch_callback_complete_count
+           << ", watch callback inflight: " << info.watch_callback_inflight_count;
+    return stream.str();
+}
+
+std::optional<RequestBlockBufferDebugInfo>
+RequestBlockBufferStore::getDebugInfoOnRequest(const std::string& requestid) const {
+    auto request_block_buffer = getRequestBlockBuffer(requestid);
+    if (request_block_buffer == nullptr) {
+        return std::nullopt;
+    }
+    return request_block_buffer->getDebugInfo();
 }
 
 std::shared_ptr<BlockBuffer> RequestBlockBufferStore::getBlockBuffer(const std::string& requestid,

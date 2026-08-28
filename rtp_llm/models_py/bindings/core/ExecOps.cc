@@ -12,6 +12,7 @@
 #include "rtp_llm/cpp/utils/KVCacheUtils.h"
 #include "rtp_llm/cpp/utils/ErrorCode.h"
 #include "rtp_llm/cpp/utils/StackTrace.h"
+#include "rtp_llm/cpp/utils/StringUtil.h"
 #include "rtp_llm/cpp/disaggregate/cache_store/ErrorCodeUtil.h"
 #include "autil/StackTracer.h"
 #include "autil/EnvUtil.h"
@@ -289,10 +290,12 @@ void runtimeWriteCacheStore(const CacheStoreInputs&     cache_store_inputs,
                                   / canonical_seq_size_per_block;
         int32_t publish_begin_block = 0;
         int32_t publish_end_block   = 0;
+        bool    terminal_publish    = false;
         if (incremental_publish) {
             const auto& publish_plan = param.publish_plan.value();
-            publish_begin_block = publish_plan.begin_block_host.data_ptr<int32_t>()[batch_id];
-            publish_end_block   = publish_plan.end_block_host.data_ptr<int32_t>()[batch_id];
+            publish_begin_block      = publish_plan.begin_block_host.data_ptr<int32_t>()[batch_id];
+            publish_end_block        = publish_plan.end_block_host.data_ptr<int32_t>()[batch_id];
+            terminal_publish         = publish_plan.terminal_host.data_ptr<bool>()[batch_id];
             RTP_LLM_CHECK_WITH_INFO(publish_begin_block >= 0 && publish_end_block >= publish_begin_block,
                                     "invalid incremental cache-store range [%d, %d) for batch %zu",
                                     publish_begin_block,
@@ -313,15 +316,32 @@ void runtimeWriteCacheStore(const CacheStoreInputs&     cache_store_inputs,
         // singleton at an unaligned prefix while CacheStore republishes the
         // complete physical block containing it. Legacy publication continues
         // to derive its range from aligned attention lengths.
-        const int canonical_total_blocks = incremental_publish ?
-                                               publish_end_block :
-                                               canonical_block_num + canonical_reuse_block_num;
-        RTP_LLM_LOG_DEBUG("write cache store, request id is %ld, blocks num is %d",
-                          request_id,
-                          canonical_total_blocks);
+        const int canonical_total_blocks =
+            incremental_publish ? publish_end_block : canonical_block_num + canonical_reuse_block_num;
+        // Trace every incremental draft-model publication, not only the terminal pass.
+        // The complete producer key set is required to distinguish a skipped earlier
+        // draft block from a terminal-key mismatch. Target-model layers remain excluded
+        // to keep the diagnostic bounded.
+        const bool trace_draft_publish = incremental_publish && param.model_id != 0;
+        RTP_LLM_LOG_DEBUG("write cache store, request id is %ld, blocks num is %d", request_id, canonical_total_blocks);
         if (canonical_total_blocks <= 0) {
+            if (trace_draft_publish) {
+                RTP_LLM_LOG_WARNING(
+                    "[cache-store-publish] phase=skip request_id=%ld model_id=%zu layer_id=%d reason=no_logical_blocks "
+                    "publish_range=[%d,%d) terminal=%d canonical_total_blocks=%d cache_keys_per_batch=%zu",
+                    request_id,
+                    param.model_id,
+                    param.layer_id,
+                    publish_begin_block,
+                    publish_end_block,
+                    static_cast<int>(terminal_publish),
+                    canonical_total_blocks,
+                    cache_keys_per_batch);
+            }
             continue;
         }
+
+        std::vector<std::string> selected_block_details;
 
         auto addBlock = [&](int key_index, int offset_index) {
             RTP_LLM_CHECK_WITH_INFO(offset_index >= 0 && offset_index < static_cast<int>(max_blocks_per_batch),
@@ -335,6 +355,18 @@ void runtimeWriteCacheStore(const CacheStoreInputs&     cache_store_inputs,
             auto block_id =
                 *(offset_addr + (param.decoder_batch_size + batch_id) * max_blocks_per_batch + offset_index);
             if (isNullBlockIdx(block_id)) {
+                if (trace_draft_publish) {
+                    const auto cache_key = makeCacheKey(param.model_id,
+                                                        param.cache_keys[batch_id * cache_keys_per_batch + key_index],
+                                                        param.layer_id,
+                                                        param.region_name);
+                    selected_block_details.push_back(
+                        fmtstr("{key_index=%d,offset_index=%d,block_id=%d,null=1,base_key=%s}",
+                               key_index,
+                               offset_index,
+                               block_id,
+                               cache_key.c_str()));
+                }
                 RTP_LLM_LOG_DEBUG(
                     "skip null kv cache block, request id [%ld], layer id [%d], region [%d], offset_index [%d]",
                     request_id,
@@ -347,6 +379,13 @@ void runtimeWriteCacheStore(const CacheStoreInputs&     cache_store_inputs,
                                                  param.cache_keys[batch_id * cache_keys_per_batch + key_index],
                                                  param.layer_id,
                                                  param.region_name);
+            if (trace_draft_publish) {
+                selected_block_details.push_back(fmtstr("{key_index=%d,offset_index=%d,block_id=%d,null=0,base_key=%s}",
+                                                        key_index,
+                                                        offset_index,
+                                                        block_id,
+                                                        cache_key.c_str()));
+            }
 
             void*                 kv_addr = (void*)((int8_t*)kv_cache_data + block_id * param.kv_block_stride_bytes);
             std::shared_ptr<void> kv_block_addr(kv_cache_owner, kv_addr);
@@ -459,17 +498,55 @@ void runtimeWriteCacheStore(const CacheStoreInputs&     cache_store_inputs,
                                        static_cast<size_t>(publish_end_block),
                                        publish_plan.terminal_host.data_ptr<bool>()[batch_id]});
         } else {
-            block_plan = buildCacheStoreBlockPlan(planned_total_blocks,
-                                                  param.cache_store_full_from_begin ?
-                                                      0 :
-                                                      static_cast<size_t>(canonical_reuse_block_num),
-                                                  use_group_cache_transfer_policy,
-                                                  group_type,
-                                                  param.cp_rank,
-                                                  param.cp_size);
+            block_plan = buildCacheStoreBlockPlan(
+                planned_total_blocks,
+                param.cache_store_full_from_begin ? 0 : static_cast<size_t>(canonical_reuse_block_num),
+                use_group_cache_transfer_policy,
+                group_type,
+                param.cp_rank,
+                param.cp_size);
         }
         for (const auto& pair : block_plan) {
             addBlock(pair.key_index, pair.offset_index);
+        }
+
+        auto joinDiagnosticValues = [](const std::vector<std::string>& values) {
+            std::ostringstream os;
+            os << "[";
+            for (size_t i = 0; i < values.size(); ++i) {
+                if (i > 0) {
+                    os << ",";
+                }
+                os << values[i];
+            }
+            os << "]";
+            return os.str();
+        };
+        const std::string selected_block_summary =
+            trace_draft_publish ? joinDiagnosticValues(selected_block_details) : std::string();
+        if (trace_draft_publish) {
+            RTP_LLM_LOG_INFO(
+                "[cache-store-publish] phase=submit request_id=%ld model_id=%zu layer_id=%d region=%d group_type=%d "
+                "publish_range=[%d,%d) terminal=%d canonical_total_blocks=%d planned_total_blocks=%zu "
+                "cache_keys_per_batch=%zu max_blocks_per_batch=%zu plan_pairs=%zu request_blocks=%zu "
+                "use_opaque=%d mla_kvcache=%d selected=%s",
+                request_id,
+                param.model_id,
+                param.layer_id,
+                static_cast<int>(param.region_name),
+                static_cast<int>(group_type),
+                publish_begin_block,
+                publish_end_block,
+                static_cast<int>(terminal_publish),
+                canonical_total_blocks,
+                planned_total_blocks,
+                cache_keys_per_batch,
+                max_blocks_per_batch,
+                block_plan.size(),
+                request_blocks->getBlocksCount(),
+                static_cast<int>(param.use_opaque_kv_cache_store),
+                static_cast<int>(mla_kvcache),
+                selected_block_summary.c_str());
         }
 
         auto storeCallback = [layer_id = param.layer_id, request_id](bool success, CacheStoreErrorCode ec) {
@@ -483,8 +560,41 @@ void runtimeWriteCacheStore(const CacheStoreInputs&     cache_store_inputs,
             }
         };
         if (request_blocks->getBlocksCount() > 0) {
-            cache_store->store(request_blocks, storeCallback);
+            if (trace_draft_publish) {
+                cache_store->store(
+                    request_blocks,
+                    [storeCallback,
+                     layer_id = param.layer_id,
+                     model_id = param.model_id,
+                     request_id,
+                     terminal_publish,
+                     selected_block_summary](bool success, CacheStoreErrorCode ec) {
+                        RTP_LLM_LOG_INFO(
+                            "[cache-store-publish] phase=callback request_id=%ld model_id=%zu layer_id=%d success=%d "
+                            "ec=%d terminal=%d selected=%s",
+                            request_id,
+                            model_id,
+                            layer_id,
+                            static_cast<int>(success),
+                            static_cast<int>(ec),
+                            static_cast<int>(terminal_publish),
+                            selected_block_summary.c_str());
+                        storeCallback(success, ec);
+                    });
+            } else {
+                cache_store->store(request_blocks, storeCallback);
+            }
         } else {
+            if (trace_draft_publish) {
+                RTP_LLM_LOG_WARNING(
+                    "[cache-store-publish] phase=skip request_id=%ld model_id=%zu layer_id=%d reason=no_blocks "
+                    "terminal=%d selected=%s",
+                    request_id,
+                    param.model_id,
+                    param.layer_id,
+                    static_cast<int>(terminal_publish),
+                    selected_block_summary.c_str());
+            }
             RTP_LLM_LOG_DEBUG("skip cache store because all selected blocks are null, request id [%ld], layer id [%d]",
                               request_id,
                               param.layer_id);

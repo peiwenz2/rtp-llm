@@ -1309,6 +1309,48 @@ absl::Status MtpExecutor::prefillStep(const std::list<GenerateStreamPtr>& stream
             final_chunk_input.kv_cache_group_types_host    = draft_kv_cache_group_types;
             maybeOverrideLastHiddenWithMtpBuffer(final_chunk_input, *model_);
 
+            if (isTpRank0() && final_chunk_input.cache_store_publish_plan.has_value()) {
+                const auto&          publish_plan  = final_chunk_input.cache_store_publish_plan.value();
+                const auto*          begin_data    = publish_plan.begin_block_host.data_ptr<int32_t>();
+                const auto*          end_data      = publish_plan.end_block_host.data_ptr<int32_t>();
+                const auto*          terminal_data = publish_plan.terminal_host.data_ptr<bool>();
+                std::vector<int32_t> begin_blocks;
+                std::vector<int32_t> end_blocks;
+                std::vector<int32_t> terminal_flags;
+                begin_blocks.reserve(publish_plan.begin_block_host.numel());
+                end_blocks.reserve(publish_plan.end_block_host.numel());
+                terminal_flags.reserve(publish_plan.terminal_host.numel());
+                for (int64_t i = 0; i < publish_plan.begin_block_host.numel(); ++i) {
+                    begin_blocks.push_back(begin_data[i]);
+                    end_blocks.push_back(end_data[i]);
+                    terminal_flags.push_back(static_cast<int32_t>(terminal_data[i]));
+                }
+                std::ostringstream source_ranges;
+                source_ranges << "[";
+                for (size_t i = 0; i < chunk_hook.terminal_round.slices.size(); ++i) {
+                    if (i > 0) {
+                        source_ranges << ",";
+                    }
+                    const auto& slice = chunk_hook.terminal_round.slices[i];
+                    source_ranges << "{request_index=" << slice.original_batch_idx << ",absolute_range=["
+                                  << slice.absolute_start << "," << slice.absolute_end << ")}";
+                }
+                source_ranges << "]";
+                RTP_LLM_LOG_INFO("[cache-store-publish] phase=final-draft-forward tp_rank=%d request_count=%zu "
+                                 "begin_blocks=[%s] end_blocks=[%s] terminal=[%s] source_ranges=%s",
+                                 tp_rank_,
+                                 chunk_hook.terminal_round.slices.size(),
+                                 vectorToString(begin_blocks).c_str(),
+                                 vectorToString(end_blocks).c_str(),
+                                 vectorToString(terminal_flags).c_str(),
+                                 source_ranges.str().c_str());
+            } else if (isTpRank0()) {
+                RTP_LLM_LOG_WARNING("[cache-store-publish] phase=final-draft-forward tp_rank=%d request_count=%zu "
+                                    "reason=missing_publish_plan",
+                                    tp_rank_,
+                                    chunk_hook.terminal_round.slices.size());
+            }
+
             maybePrintModelInput(final_chunk_input, "prefill final round draft model");
             int64_t draft_start_us = autil::TimeUtility::currentTimeInMicroSeconds();
             draft_model_output     = std::move(draft_model_->forward(final_chunk_input));
