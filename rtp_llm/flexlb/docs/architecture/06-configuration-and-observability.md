@@ -18,7 +18,7 @@ Nacos 来源在 Bean 初始化阶段创建 client、注册 Nacos listener 并缓
 3. 如果配置了 `FLEXLB_NACOS_SERVER_ADDR`，启动时从 Nacos 获取一个非空的部分
    `FlexlbConfig` JSON，并以 Nacos 中实际存在的字段覆盖环境变量基线；未出现在 Nacos
    中的字段仍使用环境变量或默认值；
-4. Nacos listener 收到合法更新后，以当前内存配置为基础覆盖推送中存在的字段，并原子
+4. Nacos listener 收到合法更新后，以当前内存配置为基础递归覆盖推送中存在的对象字段，并原子
    替换配置快照。删除或省略 Nacos 字段时保留当前内存值，不再回退环境变量。
 
 最终优先级为：`FlexlbConfig 默认值 < FLEXLB_CONFIG < 逐字段环境变量 < Nacos 字段`。
@@ -49,14 +49,45 @@ Nacos DataId 必须存在，内容必须是非空 JSON object。可识别的 `Fl
 
 启动阶段连接、读取、DataId 缺失、空配置或 Jackson 无法反序列化的内容都会阻止应用启动。
 运行阶段的非法推送不会修改当前配置，应用保留 last-known-good 快照并记录错误；下一次
-启动仍会被该非法配置阻止。配置管理层不标记配置是否支持运行时生效：动态读取的调用方
-会看到新快照，构造时复制的配置需要重启后生效。
+启动仍会被该非法配置阻止。对于需要写入已有运行对象的字段，调用方通过
+`ConfigService.addUpdateListener(projection, applier)` 注册不可变投影：所有投影先在候选
+快照上计算和校验，全部成功后才替换快照；相同投影值不会重复通知。通知在配置快照锁外串行
+执行。applier 失败不会回滚已经提交的快照，会记录错误，并在下一次仍与其上次成功值不同的
+推送中重试。动态读取的调用方会看到新快照，构造时复制的配置需要重启后生效。例外是 Local Standby 的
+`maximum_entries`、`capacity_multiplier`、`ttl_ms`、`minimum_ttl_ms` 与
+`ttl_reduction_start_ratio`：通过 Nacos 更新后会运行时生效；其中 TTL 同时更新映射索引和
+比较结果缓存。`auto_switch`、`block_size`、hash 与异步队列相关字段仍需要重启。
+
+#### 热更新订阅设计
+
+`ConfigService` 保存唯一的 `FlexlbConfig` 快照。Nacos 推送先与当前快照递归合并，再为每个
+订阅计算投影值；所有投影和校验均成功后才提交新快照。使用方注册的是一个不可变运行时值及其
+应用动作，而不是维护自己的 `xxxRuntimeSettingsProvider`：
+
+```java
+configService.addUpdateListener(
+        FlexlbConfig::getFlexlbLogLevel,
+        this::setLogLevel);
+```
+
+上述调用等价于从完整快照中提取日志等级。`projection` 应是无副作用的函数，可通过抛出异常
+拒绝候选配置；`applier` 应可重复执行，只处理已经校验的运行时值。订阅时会立即回放当前投影值，
+后续仅在投影值改变时调用 applier。复杂配置可先提取为不可变值对象，例如 Local Standby 使用
+`LocalStandbyRuntimeSettings::from` 同时校验容量和 TTL 五字段，再由缓存索引与比较缓存分别应用。
+
+`notificationLock` 串行化“初始回放并注册”与更新通知，避免订阅者在两者之间遗漏更新，并保证
+同一 applier 按配置版本顺序执行。`updateLock` 仅保护快照替换和订阅列表；用户 applier 不在其
+持锁期间执行。需要同时获取时，先获取 `notificationLock`，再获取 `updateLock`。
+
+投影或反序列化失败会拒绝整次推送并保留 last-known-good 快照。applier 失败不会回滚已提交快照，
+也不会推进该投影的最后成功值；下一次该投影仍不同于最后成功值的推送会重试。对于需要重建线程池、
+连接或组件拓扑的字段，不应注册热更新订阅，保持启动期配置并在变更后重启。
 
 ### FLEXLB_CONFIG 全量字段（`FlexlbConfig.java`）
 
 | 字段 | 默认 | 说明 |
 |---|---|---|
-| `modelServiceConfig` | 无（缺失则启动失败） | 模型路由、服务发现、KVCM 与 Optimizer 配置；可由 `MODEL_SERVICE_CONFIG` 覆盖，更新后重启生效 |
+| `modelServiceConfig` | 无（缺失则启动失败） | 模型路由、服务发现、KVCM 与 Optimizer 配置；可由 `MODEL_SERVICE_CONFIG` 覆盖。除 `kvcm.local_standby` 的容量与 TTL 五字段外，更新后重启生效 |
 | `blockHashStrategy` | `VLLM` | cache block hash 策略：`VLLM` / `SGLANG`；可由 `BLOCK_HASH_STRATEGY` 覆盖 |
 | `loadBalanceStrategy` | `SHORTEST_TTFT` | PDFUSION/PREFILL 策略 |
 | `decodeLoadBalanceStrategy` | `WEIGHTED_CACHE` | DECODE 策略 |
@@ -86,7 +117,8 @@ Nacos DataId 必须存在，内容必须是非空 JSON object。可识别的 `Fl
 
 统一配置字段为 `FlexlbConfig.modelServiceConfig`，环境变量 `MODEL_SERVICE_CONFIG` 仍然兼容，
 Nacos 中使用对象字段 `modelServiceConfig`。缺省**启动失败**。配置更新后由 ConfigService 保存
-最新快照，模型路由相关组件在启动时初始化，因此需要重启生效。反序列化为 `ServiceRoute`：
+最新快照，模型路由相关组件在启动时初始化，因此需要重启生效；但
+`kvcm.local_standby` 的容量与 TTL 五字段由 `LocalStandbyRuntimeSettings` 投影应用。反序列化为 `ServiceRoute`：
 
 - `service_id`（必填）、`role_endpoints: List<GroupRoleEndPoint>`（必填非空）、`kvcm`。
 - `GroupRoleEndPoint`：`group` + `prefill_endpoint` / `decode_endpoint` / `vit_endpoint` /
@@ -101,7 +133,9 @@ Nacos 中使用对象字段 `modelServiceConfig`。缺省**启动失败**。配�
 - `LocalStandbyConfig`：`auto_switch=true`、`block_size=0`（0=沿用引擎块大小）、
   `ttl_ms=300000`、`minimum_ttl_ms=100000`、`ttl_reduction_start_ratio=0.8`、
   `maximum_entries=2000000`、`capacity_multiplier=10.0`、`async_queue_capacity=100000`、
-  `hash_thread_count=4`、`hash_queue_capacity=100000`。
+  `hash_thread_count=4`、`hash_queue_capacity=100000`。其中仅 `maximum_entries`、
+  `capacity_multiplier`、`ttl_ms`、`minimum_ttl_ms`、`ttl_reduction_start_ratio` 支持 Nacos
+  运行时更新；其余字段需要重启。
 - `OptimizerConfig`（可选）：`enabled`、`address`、`port=8082`（覆盖服务发现返回的
   端口，discovery 仅提供 IP）、`path=/api/optimizer`、
   `discovery`。启用后仅在成功调度结束时，由专用 `doFinally` 线程池异步发送

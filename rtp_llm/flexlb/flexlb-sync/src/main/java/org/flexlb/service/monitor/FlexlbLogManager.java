@@ -1,6 +1,7 @@
 package org.flexlb.service.monitor;
 
 import org.flexlb.config.ConfigService;
+import org.flexlb.config.FlexlbConfig;
 import org.flexlb.enums.LogLevel;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.logging.LoggerGroup;
@@ -30,10 +31,8 @@ public class FlexlbLogManager {
         this.loggerGroup = Objects.requireNonNull(
                 loggerGroups.get(LOG_GROUP_NAME), "Logging group 'flexlb' is not configured");
         this.stdoutController = stdoutController;
-        configService.addUpdateListener(config -> {
-            setLogLevel(config.getFlexlbLogLevel());
-            setStdoutLogEnabled(config.isEnableStdoutLog());
-        });
+        configService.addUpdateListener(FlexlbConfig::getFlexlbLogLevel, this::setLogLevel);
+        configService.addUpdateListener(FlexlbConfig::isEnableStdoutLog, this::setStdoutLogEnabled);
     }
 
     public LogLevel setLogLevel(LogLevel logLevel) {

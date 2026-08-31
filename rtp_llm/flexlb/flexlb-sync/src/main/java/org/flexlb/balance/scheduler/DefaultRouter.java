@@ -4,6 +4,7 @@ import org.apache.commons.collections4.CollectionUtils;
 import org.flexlb.balance.strategy.LoadBalanceStrategyFactory;
 import org.flexlb.balance.strategy.LoadBalancer;
 import org.flexlb.config.ConfigService;
+import org.flexlb.config.FlexlbConfig;
 import org.flexlb.dao.BalanceContext;
 import org.flexlb.dao.loadbalance.Response;
 import org.flexlb.dao.loadbalance.RoutingResult;
@@ -113,7 +114,7 @@ public class DefaultRouter implements Router {
         String group = null;
 
         for (RoleType roleType : roleTypeList) {
-            LoadBalancer loadBalancer = getLoadBalancer(roleType);
+            LoadBalancer loadBalancer = getLoadBalancer(balanceContext, roleType);
             ServerStatus serverStatus = loadBalancer.select(balanceContext, roleType, group);
 
             if (!serverStatus.isSuccess()) {
@@ -135,8 +136,10 @@ public class DefaultRouter implements Router {
     /**
      * Get LoadBalancer based on role type
      */
-    private LoadBalancer getLoadBalancer(RoleType roleType) {
-        LoadBalanceStrategyEnum strategy = configService.loadBalanceConfig().getStrategyForRoleType(roleType);
+    private LoadBalancer getLoadBalancer(BalanceContext balanceContext, RoleType roleType) {
+        FlexlbConfig config = balanceContext.getConfig();
+        LoadBalanceStrategyEnum strategy = (config == null ? configService.loadBalanceConfig() : config)
+                .getStrategyForRoleType(roleType);
         return LoadBalanceStrategyFactory.getLoadBalancer(strategy);
     }
 
@@ -155,7 +158,7 @@ public class DefaultRouter implements Router {
             String requestId = balanceContext.getRequestId();
 
             RoleType role = serverStatus.getRole();
-            LoadBalancer loadBalancer = getLoadBalancer(role);
+            LoadBalancer loadBalancer = getLoadBalancer(balanceContext, role);
             loadBalancer.rollBack(serverIpPort, requestId);
         }
     }

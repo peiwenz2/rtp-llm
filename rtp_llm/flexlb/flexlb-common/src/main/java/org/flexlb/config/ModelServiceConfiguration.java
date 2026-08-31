@@ -80,18 +80,15 @@ public class ModelServiceConfiguration {
         }
         if (localStandby.getBlockSize() < 0
                 || localStandby.getBlockSize() > Integer.MAX_VALUE
-                || localStandby.getTtlMs() <= 0
-                || localStandby.getMinimumTtlMs() <= 0
-                || localStandby.getMinimumTtlMs() > localStandby.getTtlMs()
-                || !Double.isFinite(localStandby.getTtlReductionStartRatio())
-                || localStandby.getTtlReductionStartRatio() <= 0
-                || localStandby.getTtlReductionStartRatio() >= 1
-                || localStandby.getMaximumEntries() <= 0
-                || !Double.isFinite(localStandby.getCapacityMultiplier())
-                || localStandby.getCapacityMultiplier() < 1.0
                 || localStandby.getAsyncQueueCapacity() <= 0
                 || localStandby.getHashThreadCount() <= 0
                 || localStandby.getHashQueueCapacity() <= 0) {
+            throw new IllegalArgumentException(
+                    "MODEL_SERVICE_CONFIG kvcm.local_standby contains invalid values");
+        }
+        try {
+            LocalStandbyRuntimeSettings.from(localStandby);
+        } catch (IllegalArgumentException e) {
             throw new IllegalArgumentException(
                     "MODEL_SERVICE_CONFIG kvcm.local_standby contains invalid values");
         }

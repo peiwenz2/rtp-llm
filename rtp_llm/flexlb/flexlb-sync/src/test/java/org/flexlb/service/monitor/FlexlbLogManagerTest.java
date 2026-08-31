@@ -10,6 +10,7 @@ import org.springframework.boot.logging.LoggingSystem;
 import java.util.List;
 import java.util.Map;
 import java.util.function.Consumer;
+import java.util.function.Function;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.mockito.ArgumentMatchers.any;
@@ -37,6 +38,7 @@ class FlexlbLogManagerTest {
     }
 
     @Test
+    @SuppressWarnings("unchecked")
     void appliesConfigUpdates() {
         LoggingSystem loggingSystem = mock(LoggingSystem.class);
         List<String> members = List.of("org.flexlb", "flexlbLogger");
@@ -47,10 +49,11 @@ class FlexlbLogManagerTest {
         config.setFlexlbLogLevel(LogLevel.WARN);
         config.setEnableStdoutLog(true);
         doAnswer(invocation -> {
-            Consumer<FlexlbConfig> listener = invocation.getArgument(0);
-            listener.accept(config);
+            Function<FlexlbConfig, Object> projection = invocation.getArgument(0);
+            Consumer<Object> listener = invocation.getArgument(1);
+            listener.accept(projection.apply(config));
             return null;
-        }).when(configService).addUpdateListener(any());
+        }).when(configService).addUpdateListener(any(), any());
 
         new FlexlbLogManager(loggingSystem, loggerGroups, configService, stdoutController);
 

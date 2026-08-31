@@ -2,6 +2,9 @@ package org.flexlb.cache.match.localstandby;
 
 import org.flexlb.cache.telemetry.CacheMetricsReporter;
 import org.flexlb.config.CacheMatchConfiguration;
+import org.flexlb.config.ConfigService;
+import org.flexlb.config.FlexlbConfig;
+import org.flexlb.config.LocalStandbyRuntimeSettings;
 import org.flexlb.config.ModelMetaConfig;
 import org.flexlb.dao.master.CacheStatus;
 import org.flexlb.dao.master.WorkerStatus;
@@ -16,9 +19,14 @@ import org.junit.jupiter.api.Test;
 
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Consumer;
+import java.util.function.Function;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyLong;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -141,6 +149,41 @@ class LocalStandbyCacheManagerTest {
         manager.addRoutedRequestBlocks(worker.getIpPort(), List.of(11L));
 
         assertEquals(1_000, manager.maximumEntryCount());
+        manager.shutdown();
+    }
+
+    @Test
+    void refreshesCapacityWhenRuntimeConfigChangesMaximumEntriesAndMultiplier() {
+        WorkerStatusProvider workerStatusProvider = mock(WorkerStatusProvider.class);
+        WorkerStatus worker = workerWithCacheCapacity("10.0.0.1", 8080, 10_000, 100);
+        when(workerStatusProvider.getWorkerStatuses(RoleType.PREFILL, "default"))
+                .thenReturn(List.of(worker));
+        ModelMetaConfig modelMetaConfig = modelMetaConfig(300_000, 2_000, 10.0);
+        CacheMatchConfiguration configuration = new CacheMatchConfiguration(modelMetaConfig);
+        FlexlbConfig initialConfig = new FlexlbConfig();
+        initialConfig.setModelServiceConfig(modelMetaConfig.getServiceRoutes().iterator().next());
+        AtomicReference<Consumer<FlexlbConfig>> configUpdateListener = new AtomicReference<>();
+        ConfigService configService = mock(ConfigService.class);
+        doAnswer(invocation -> {
+            Function<FlexlbConfig, LocalStandbyRuntimeSettings> projection = invocation.getArgument(0);
+            Consumer<LocalStandbyRuntimeSettings> listener = invocation.getArgument(1);
+            configUpdateListener.set(config -> listener.accept(projection.apply(config)));
+            listener.accept(projection.apply(initialConfig));
+            return null;
+        }).when(configService).addUpdateListener(any(), any());
+        LocalStandbyCacheManager manager = new LocalStandbyCacheManager(
+                configuration, workerStatusProvider, mock(CacheMetricsReporter.class), configService);
+
+        assertEquals(1_000, manager.maximumEntryCount());
+
+        FlexlbConfig updatedConfig = new FlexlbConfig();
+        updatedConfig.setModelServiceConfig(modelMetaConfig(300_000, 250, 2.0)
+                .getServiceRoutes()
+                .iterator()
+                .next());
+        configUpdateListener.get().accept(updatedConfig);
+
+        assertEquals(200, manager.maximumEntryCount());
         manager.shutdown();
     }
 

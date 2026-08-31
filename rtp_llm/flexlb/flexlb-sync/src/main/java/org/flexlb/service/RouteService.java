@@ -56,7 +56,10 @@ public class RouteService {
      * @param balanceContext Load balancing context
      */
     public void cancel(BalanceContext balanceContext) {
-        FlexlbConfig flexlbConfig = configService.loadBalanceConfig();
+        FlexlbConfig flexlbConfig = balanceContext.getConfig();
+        if (flexlbConfig == null) {
+            flexlbConfig = configService.loadBalanceConfig();
+        }
         if (flexlbConfig.isEnableQueueing()) {
             balanceContext.cancel();
             CompletableFuture<Response> future = balanceContext.getFuture();

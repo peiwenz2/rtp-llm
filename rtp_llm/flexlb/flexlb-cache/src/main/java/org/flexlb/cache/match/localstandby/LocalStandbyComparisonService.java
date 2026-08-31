@@ -8,10 +8,13 @@ import org.flexlb.cache.domain.CacheMatchQuery;
 import org.flexlb.cache.domain.CacheMatchResult;
 import org.flexlb.cache.domain.CacheMatchSource;
 import org.flexlb.config.CacheMatchConfiguration;
+import org.flexlb.config.ConfigService;
+import org.flexlb.config.LocalStandbyRuntimeSettings;
 import org.flexlb.dao.cache.HostCacheMatch;
 import org.flexlb.dao.master.CacheHitFeedback;
 import org.flexlb.dao.route.LocalStandbyConfig;
 import org.flexlb.dao.route.RoleType;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
 import java.util.Collections;
@@ -31,6 +34,13 @@ public class LocalStandbyComparisonService {
     private final Cache<LocalStandbyPredictionKey, CompletableFuture<StandbyPrediction>> pendingLocalStandbyPredictions;
 
     public LocalStandbyComparisonService(CacheMatchConfiguration configuration, LocalStandbyCacheMatchProvider localStandbyProvider) {
+        this(configuration, localStandbyProvider, null);
+    }
+
+    @Autowired
+    public LocalStandbyComparisonService(CacheMatchConfiguration configuration,
+                                         LocalStandbyCacheMatchProvider localStandbyProvider,
+                                         ConfigService configService) {
         LocalStandbyConfig config = configuration.getLocalStandbyConfig();
         this.enabled = configuration.isLocalStandbyEnabled();
         this.localStandbyProvider = localStandbyProvider;
@@ -41,6 +51,9 @@ public class LocalStandbyComparisonService {
                 .maximumSize(queueCapacity)
                 .expireAfterWrite(enabled ? config.getTtlMs() : LocalStandbyConfig.DEFAULT_TTL_MS, TimeUnit.MILLISECONDS)
                 .build();
+        if (enabled && configService != null) {
+            configService.addUpdateListener(LocalStandbyRuntimeSettings::from, this::updateRuntimeSettings);
+        }
     }
 
     public void trackLocalStandbyPrediction(CacheMatchQuery query) {
@@ -119,6 +132,12 @@ public class LocalStandbyComparisonService {
     private void storePrediction(CacheMatchQuery query, CompletableFuture<StandbyPrediction> prediction) {
         pendingLocalStandbyPredictions.put(
                 new LocalStandbyPredictionKey(query.requestId(), query.roleType()), prediction);
+    }
+
+    private void updateRuntimeSettings(LocalStandbyRuntimeSettings settings) {
+        pendingLocalStandbyPredictions.policy().expireAfterWrite()
+                .orElseThrow(() -> new IllegalStateException("Local Standby prediction cache expiration is unavailable"))
+                .setExpiresAfter(settings.ttlMs(), TimeUnit.MILLISECONDS);
     }
 
     private CacheHitComparisonResult result(CacheHitFeedback feedback,

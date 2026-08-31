@@ -144,6 +144,23 @@ class DefaultRouterTest {
     }
 
     @Test
+    void selectsLoadBalancerFromTheRequestConfigurationSnapshot() {
+        FlexlbConfig requestConfig = org.mockito.Mockito.mock(FlexlbConfig.class);
+        when(balanceContext.getConfig()).thenReturn(requestConfig);
+        when(requestConfig.getStrategyForRoleType(RoleType.PREFILL)).thenReturn(LoadBalanceStrategyEnum.RANDOM);
+        ServerStatus serverStatus = new ServerStatus();
+        serverStatus.setSuccess(true);
+        serverStatus.setGroup("group");
+        when(vitLoadBalancer.select(balanceContext, RoleType.PREFILL, null)).thenReturn(serverStatus);
+
+        defaultRouter.routeByRoleType(balanceContext, java.util.List.of(RoleType.PREFILL));
+
+        verify(vitLoadBalancer).select(balanceContext, RoleType.PREFILL, null);
+        verify(prefillLoadBalancer, org.mockito.Mockito.never()).select(any(), any(), any());
+        verify(configService, org.mockito.Mockito.never()).loadBalanceConfig();
+    }
+
+    @Test
     void should_return_response_with_no_available_worker_error_when_model_not_in_worker_status_map() {
         // Execute
         Response response = defaultRouter.route(balanceContext);

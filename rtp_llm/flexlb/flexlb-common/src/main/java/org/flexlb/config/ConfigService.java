@@ -12,8 +12,10 @@ import javax.annotation.PreDestroy;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Objects;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
+import java.util.function.Function;
 
 @Slf4j
 @Component
@@ -23,8 +25,19 @@ public class ConfigService {
     private static final List<ConfigSource> CONFIG_SOURCES = new ArrayList<>();
 
     private final AtomicReference<FlexlbConfig> currentConfig;
-    private final List<Consumer<FlexlbConfig>> updateListeners = new ArrayList<>();
+    private final List<ConfigUpdateListener> updateListeners = new ArrayList<>();
+
+    /**
+     * Guards configuration-source initialization, snapshot replacement and listener registration.
+     * User-provided listeners are never invoked while this lock is held.
+     */
     private final Object updateLock = new Object();
+
+    /**
+     * Serializes listener initialization and update delivery so each listener observes projected
+     * values in configuration order. When both locks are needed, this lock is acquired first.
+     */
+    private final Object notificationLock = new Object();
 
     public ConfigService() {
         this.currentConfig = new AtomicReference<>(new FlexlbConfig());
@@ -40,10 +53,29 @@ public class ConfigService {
         return currentConfig.get();
     }
 
-    public void addUpdateListener(Consumer<FlexlbConfig> listener) {
-        synchronized (updateLock) {
-            updateListeners.add(listener);
-            listener.accept(currentConfig.get());
+    /**
+     * Registers a runtime setting derived from the current FlexLB configuration.
+     *
+     * <p>The projection is evaluated before a configuration snapshot is committed, so it can
+     * validate the setting by throwing an exception. The applier receives the current value
+     * immediately and only receives later values when the projected setting changes.
+     *
+     * @param projection non-null function that derives a runtime setting from a configuration snapshot
+     * @param listener non-null consumer that applies the derived runtime setting
+     */
+    public <T> void addUpdateListener(Function<FlexlbConfig, T> projection, Consumer<T> listener) {
+        ProjectedConfigUpdateListener<T> updateListener = new ProjectedConfigUpdateListener<>(projection, listener);
+
+        synchronized (notificationLock) {
+            T initialValue;
+            synchronized (updateLock) {
+                initialValue = projection.apply(currentConfig.get());
+            }
+            listener.accept(initialValue);
+            synchronized (updateLock) {
+                updateListener.initialize(initialValue);
+                updateListeners.add(updateListener);
+            }
         }
     }
 
@@ -68,19 +100,33 @@ public class ConfigService {
     }
 
     private void receiveConfigUpdate(ConfigSource source, String content) {
-        synchronized (updateLock) {
+        synchronized (notificationLock) {
             try {
-                FlexlbConfig newConfig = mergeConfig(currentConfig.get(), content, source.name());
-                currentConfig.set(newConfig);
-                for (Consumer<FlexlbConfig> listener : updateListeners) {
-                    listener.accept(newConfig);
+                List<Runnable> notifications;
+                synchronized (updateLock) {
+                    FlexlbConfig newConfig = mergeConfig(currentConfig.get(), content, source.name());
+                    notifications = updateListeners.stream()
+                            .map(listener -> listener.prepareUpdate(newConfig))
+                            .toList();
+                    currentConfig.set(newConfig);
                 }
+                notifyListeners(notifications, source.name());
                 log.info("Applied FlexLB configuration update from {} source", source.name());
             } catch (Exception e) {
                 log.error(
                         "Rejected invalid FlexLB configuration update from {} source; keeping last-known-good configuration: {}",
                         source.name(),
                         e.getMessage());
+            }
+        }
+    }
+
+    private void notifyListeners(List<Runnable> notifications, String sourceName) {
+        for (Runnable notification : notifications) {
+            try {
+                notification.run();
+            } catch (RuntimeException e) {
+                log.error("Applied FlexLB configuration update from {} source, but a runtime listener failed", sourceName, e);
             }
         }
     }
@@ -99,10 +145,22 @@ public class ConfigService {
         }
 
         ObjectNode merged = (ObjectNode) JsonUtils.toTreeNode(baseConfig);
-        merged.setAll(overrides);
+        mergeObjectFields(merged, overrides);
         FlexlbConfig config = JsonUtils.toObject(merged, FlexlbConfig.class);
         log.debug("Resolved FlexLB configuration from {} source", sourceName);
         return config;
+    }
+
+    private void mergeObjectFields(ObjectNode base, ObjectNode overrides) {
+        overrides.fields().forEachRemaining(field -> {
+            JsonNode existing = base.get(field.getKey());
+            JsonNode override = field.getValue();
+            if (existing instanceof ObjectNode existingObject && override instanceof ObjectNode overrideObject) {
+                mergeObjectFields(existingObject, overrideObject);
+                return;
+            }
+            base.set(field.getKey(), override);
+        });
     }
 
     @PreDestroy
@@ -125,6 +183,49 @@ public class ConfigService {
             source.close();
         } catch (Exception e) {
             log.warn("Failed to close {} configuration source", source.name(), e);
+        }
+    }
+
+    private interface ConfigUpdateListener {
+
+        Runnable prepareUpdate(FlexlbConfig config);
+    }
+
+    /**
+     * Applies one projected configuration value and tracks the last value applied successfully.
+     *
+     * <p>Each candidate snapshot is projected before it is committed. Unchanged values return a
+     * no-op notification. The returned notification updates {@code currentValue} only after the
+     * consumer succeeds, so a failed consumer is retried by a later update whose value still
+     * differs from the last successful value.
+     *
+     * <p>Instances are accessed while {@link ConfigService#notificationLock} is held.
+     */
+    private static class ProjectedConfigUpdateListener<T> implements ConfigUpdateListener {
+
+        private final Function<FlexlbConfig, T> projection;
+        private final Consumer<T> listener;
+        private T currentValue;
+
+        private ProjectedConfigUpdateListener(Function<FlexlbConfig, T> projection, Consumer<T> listener) {
+            this.projection = projection;
+            this.listener = listener;
+        }
+
+        private void initialize(T initialValue) {
+            currentValue = initialValue;
+        }
+
+        @Override
+        public Runnable prepareUpdate(FlexlbConfig config) {
+            T updatedValue = projection.apply(config);
+            if (Objects.equals(currentValue, updatedValue)) {
+                return () -> {};
+            }
+            return () -> {
+                listener.accept(updatedValue);
+                currentValue = updatedValue;
+            };
         }
     }
 
