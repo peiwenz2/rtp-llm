@@ -34,6 +34,9 @@ from rtp_llm.models_py.modules.dsv4.attn_type import (
     INDEXER_STATE,
     SWA_KV,
 )
+from rtp_llm.models_py.modules.dsv4.kv_cache_utils import (
+    build_block_tables_batched,
+)
 from rtp_llm.models_py.modules.dsv4.fp8._kv_cache_utils import (
     require_pool_tokens_per_block,
 )
@@ -204,31 +207,17 @@ def build_metadata_eager(
     paged_block_tables: Dict[int, Any] = {}
     paged_entries_per_block: Dict[int, int] = {}
     paged_tokens_per_block: Dict[int, int] = {}
-    if paged_pool_specs:
-        by_group = getattr(attn, "kv_cache_kernel_block_id_device_by_group", None)
-        group_region_names = (
-            getattr(kv_cache, "group_region_names", None)
-            if kv_cache is not None
-            else None
-        )
-        if by_group is not None and len(by_group) > 0 and group_region_names:
-            # Walk the framework's group list: position IS the group id,
-            # entry IS the attn_type. Keep the group only if the decode
-            # impl asked for it via paged_pool_specs.
-            for group_id, attn_type_enum in enumerate(group_region_names):
-                if group_id >= len(by_group):
-                    continue
-                attn_type = int(attn_type_enum)
-                spec = paged_pool_specs.get(attn_type)
-                if spec is None:
-                    continue
-                entries_per_block = int(spec[0])
-                paged_tokens_per_block[attn_type] = int(spec[1])
-                group_block_table = by_group[group_id]
-                if group_block_table is None or group_block_table.numel() == 0:
-                    continue
-                paged_block_tables[attn_type] = group_block_table
-                paged_entries_per_block[attn_type] = entries_per_block
+    block_tables_by_region = (
+        build_block_tables_batched(kv_cache, attn) if paged_pool_specs else None
+    )
+    if block_tables_by_region:
+        for attn_type, spec in paged_pool_specs.items():
+            group_block_table = block_tables_by_region.get(int(attn_type))
+            if group_block_table is None:
+                continue
+            paged_block_tables[int(attn_type)] = group_block_table
+            paged_entries_per_block[int(attn_type)] = int(spec[0])
+            paged_tokens_per_block[int(attn_type)] = int(spec[1])
 
     if fp8_kv_cache:
         from rtp_llm.models_py.modules.dsv4.fp8.decode.decode_attn_metadata import (

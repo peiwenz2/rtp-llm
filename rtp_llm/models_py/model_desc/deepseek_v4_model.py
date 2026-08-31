@@ -46,6 +46,9 @@ from rtp_llm.models_py.modules.dsv4.decode.forward import (
     build_paged_pool_specs,
     forward_decode,
 )
+from rtp_llm.models_py.modules.dsv4.kv_cache_utils import (
+    resolve_block_table_group_ids,
+)
 from rtp_llm.models_py.modules.dsv4.moe.moe_layer import (
     chunked_moe_enabled,
     cp_padded_tokens_per_rank_bound,
@@ -1061,19 +1064,28 @@ class DeepSeekV4Model(GptModelBase):
         paged_pool_specs = build_paged_pool_specs(
             self.kv_cache, self.v4, max_seq_len=int(self._v4_args.max_seq_len)
         )
-        # Snapshot framework's group ordering — CUDA-graph replay path
-        # inside the impl's ``prepare`` has no live kv_cache, so carry
-        # the list in the config. Position IS the group id.
-        group_region_names_snapshot = (
-            [int(t) for t in (self.kv_cache.group_region_names or [])]
-            if self.kv_cache is not None
-            else []
-        )
-
         if self.kv_cache is None:
             raise RuntimeError(
                 "DSV4 prepare_decode_metadata: self.kv_cache is None; "
                 "C++ KVCacheManager must propagate KVCache before forward."
+            )
+        # CUDA-graph replay has no live kv_cache. Snapshot typed region ->
+        # process-wide physical group id now, while target and MTP draft each
+        # still have their own model-specific KVCache layout.
+        table_group_ids = resolve_block_table_group_ids(self.kv_cache)
+        paged_table_group_ids = {
+            int(attn_type): int(table_group_ids[int(attn_type)])
+            for attn_type in paged_pool_specs
+            if int(attn_type) in table_group_ids
+        }
+        missing_table_groups = sorted(
+            set(int(attn_type) for attn_type in paged_pool_specs)
+            - set(paged_table_group_ids)
+        )
+        if missing_table_groups:
+            raise RuntimeError(
+                "DSV4 paged pools have no physical block-table groups: %r"
+                % missing_table_groups
             )
         cfg_kwargs = dict(
             max_batch_size=batch_size,
@@ -1086,7 +1098,7 @@ class DeepSeekV4Model(GptModelBase):
             ],
             index_topk=int(self._v4_args.index_topk),
             paged_pool_specs=paged_pool_specs,
-            group_region_names=group_region_names_snapshot,
+            paged_table_group_ids=paged_table_group_ids,
         )
         cfg = _DecodeFmhaImplConfig(**cfg_kwargs)
         impl = _DecodeFmhaImpl(
