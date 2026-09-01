@@ -72,6 +72,7 @@ class Block(nn.Module):
         ep_rank: int = 0,
         max_tokens_per_rank: int = 8192,
         is_decode_role: bool = False,
+        moe_strategy: str = "auto",
         fp8_kv_cache: bool = False,
     ):
         super().__init__()
@@ -124,6 +125,7 @@ class Block(nn.Module):
             ep_rank=ep_rank,
             max_tokens_per_rank=max_tokens_per_rank,
             is_decode_role=is_decode_role,
+            strategy=moe_strategy,
         )
         # Framework loader already casts norms to bf16 (compute_dtype) and
         # hc_* tensors to fp32 (descriptor data_type); pass refs straight
@@ -167,9 +169,8 @@ class Block(nn.Module):
         if os.environ.get("DSV4_CP_SYNC_AFTER_ATTN_ONCE", "1") == "0":
             return
         if getattr(getattr(self.ffn, "_strategy", None), "name", "") not in (
-            "mega",
-            "mega_fused",
-            "mega_se",
+            "mega_moe",
+            "mega_moe_se",
         ):
             return
         if getattr(self.attn, "_cp_ctx", None) is None:

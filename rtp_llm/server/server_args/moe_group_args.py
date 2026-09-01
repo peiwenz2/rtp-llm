@@ -182,6 +182,8 @@ def init_moe_group_args(parser, moe_config, eplb_config, deep_ep_config):
             "fp4_ep_low_latency",
             "fp4_ep_normal",
             "fp4_no_dp",
+            "mega_moe",
+            "mega_moe_se",
         ],
         default="auto",
         help="指定moe strategy, 默认为auto",

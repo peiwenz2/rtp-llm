@@ -11,7 +11,7 @@ from .quant_layouts import _per_token_cast_to_fp8_packed_ue8m0
 from .shared_expert import strict_fused_moe_enabled
 
 
-class MegaMoeSEInputPacker(ABC):
+class MegaMoESEInputPacker(ABC):
     name: str
 
     @abstractmethod
@@ -27,13 +27,13 @@ class MegaMoeSEInputPacker(ABC):
         raise NotImplementedError
 
 
-class TorchMegaMoeSEInputPacker(MegaMoeSEInputPacker):
+class TorchMegaMoESEInputPacker(MegaMoESEInputPacker):
     name = "torch"
 
     def pack(self, x, weights, indices, buf, tokens, block_m) -> None:
         if strict_fused_moe_enabled():
             raise RuntimeError(
-                "DSV4_MOE_STRICT_FUSED=1 forbids TorchMegaMoeSEInputPacker"
+                "DSV4_MOE_STRICT_FUSED=1 forbids TorchMegaMoESEInputPacker"
             )
         safe_x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0).contiguous()
         x_fp8, x_sf = _per_token_cast_to_fp8_packed_ue8m0(safe_x, gran_k=32)
@@ -48,13 +48,13 @@ class TorchMegaMoeSEInputPacker(MegaMoeSEInputPacker):
         )
 
 
-class FusedMegaMoeSEInputPacker(MegaMoeSEInputPacker):
+class FusedMegaMoESEInputPacker(MegaMoESEInputPacker):
     name = "fused"
 
     def pack(self, x, weights, indices, buf, tokens, block_m) -> None:
         if not (x.is_cuda and x.dtype == torch.bfloat16 and x.shape[1] % 128 == 0):
             raise RuntimeError(
-                "DSV4 fused MegaMoE-SE input packer requires CUDA bf16 input "
+                "DSV4 fused MegaMoESE input packer requires CUDA bf16 input "
                 f"with hidden dim divisible by 128; got device={x.device}, "
                 f"dtype={x.dtype}, shape={tuple(x.shape)}"
             )
@@ -73,24 +73,24 @@ class FusedMegaMoeSEInputPacker(MegaMoeSEInputPacker):
         )
 
 
-def get_mega_moe_se_input_packer() -> MegaMoeSEInputPacker:
+def get_mega_moe_se_input_packer() -> MegaMoESEInputPacker:
     mode = os.environ.get("DSV4_MEGA_MOE_INPUT_PACKER", "fused").strip().lower()
     if mode == "torch":
         if strict_fused_moe_enabled():
             raise RuntimeError(
                 "DSV4_MOE_STRICT_FUSED=1 forbids DSV4_MEGA_MOE_INPUT_PACKER=torch"
             )
-        return TorchMegaMoeSEInputPacker()
+        return TorchMegaMoESEInputPacker()
     if mode in ("auto", "fused"):
-        return FusedMegaMoeSEInputPacker()
+        return FusedMegaMoESEInputPacker()
     raise ValueError(
         f"invalid DSV4_MEGA_MOE_INPUT_PACKER={mode!r}; expected auto|torch|fused"
     )
 
 
 __all__ = [
-    "FusedMegaMoeSEInputPacker",
-    "MegaMoeSEInputPacker",
-    "TorchMegaMoeSEInputPacker",
+    "FusedMegaMoESEInputPacker",
+    "MegaMoESEInputPacker",
+    "TorchMegaMoESEInputPacker",
     "get_mega_moe_se_input_packer",
 ]

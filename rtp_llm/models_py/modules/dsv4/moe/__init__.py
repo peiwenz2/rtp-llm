@@ -11,7 +11,7 @@ Internal layout (Phase 1 complete):
   - expert.py: Expert + mandatory fused SiLU path
   - quant_layouts.py: FP4_BLOCK / FP8_BLOCK / per-token-cast helper
   - mega_buf.py: symm-mem buffer cache + capability gates
-  - strategies/{base,mega,grouped_fp4,local_loop,deepep}.py:
+  - strategies/{base,mega,mega_se,grouped_fp4,local_loop,deepep}.py:
     routed-expert compute strategies + select_strategy
 
 See ``.claude/plans/optimized-riding-mist.md`` for design + Phase 2 plan.

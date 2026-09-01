@@ -25,7 +25,7 @@ from ..input_packer import get_mega_moe_input_packer
 from ..mega_buf import (
     _get_or_create_mega_buf,
     _get_or_create_mega_output,
-    _mega_moe_enabled,
+    _mega_moe_available,
 )
 from ..mega_jit_warmup import (
     clamp_token_counts,
@@ -35,8 +35,8 @@ from ..mega_jit_warmup import (
     parse_mega_moe_jit_warmup_tokens_override,
 )
 from ..shared_expert import strict_fused_moe_enabled
-from .base import MoeCfg, RoutedExpertsStrategy, register_strategy
 from ..warmup_sync import sync_cuda_graph_warmup_ranks
+from .base import MoeCfg, RoutedExpertsStrategy, register_strategy
 
 _MEGA_MOE_JIT_WARMED_KEYS: set[tuple] = set()
 _MEGA_MOE_NVCC_TMPDIR_ENV = "DSV4_MEGA_MOE_NVCC_TMPDIR"
@@ -76,7 +76,9 @@ def _get_gate_pack_kernels():
 
 def _gate_pack_input_packer_env_allows() -> bool:
     mode = os.environ.get("DSV4_MEGA_MOE_INPUT_PACKER", "fused").strip().lower()
-    impl = os.environ.get("DSV4_MEGA_MOE_INPUT_PACKER_IMPL", "optimized").strip().lower()
+    impl = (
+        os.environ.get("DSV4_MEGA_MOE_INPUT_PACKER_IMPL", "optimized").strip().lower()
+    )
     return mode in ("auto", "fused") and impl == "optimized"
 
 
@@ -177,13 +179,12 @@ def _log_pre_kernel_barrier(
 
 @register_strategy
 class MegaMoEStrategy(RoutedExpertsStrategy):
-    name = "mega"
+    name = "mega_moe"
 
     @classmethod
     def can_handle(cls, cfg: MoeCfg) -> bool:
         # Mega requires EP > 1, SM100, dist-init — all checked by
-        # ``_mega_moe_enabled()`` except ep_size > 1, which we check here.
-        return cfg.ep_size > 1 and _mega_moe_enabled()
+        return cfg.ep_size > 1 and _mega_moe_available()
 
     def setup_weights(self, layer_weights: Dict) -> None:
         """Stack EP-local routed-expert SFs into the int32 UTCCP-transposed
@@ -691,9 +692,7 @@ class MegaMoEStrategy(RoutedExpertsStrategy):
         rank = dist.get_rank(group)
         world_size = dist.get_world_size(group)
         device = self._mega_l1_w.device
-        _log_pre_kernel_barrier(
-            "enter", cfg.layer_id, rank, world_size, tokens, device
-        )
+        _log_pre_kernel_barrier("enter", cfg.layer_id, rank, world_size, tokens, device)
 
         if device.type == "cuda":
             with torch.cuda.device(device):
@@ -708,6 +707,4 @@ class MegaMoEStrategy(RoutedExpertsStrategy):
         else:
             dist.barrier(group=group)
 
-        _log_pre_kernel_barrier(
-            "leave", cfg.layer_id, rank, world_size, tokens, device
-        )
+        _log_pre_kernel_barrier("leave", cfg.layer_id, rank, world_size, tokens, device)

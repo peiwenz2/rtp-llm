@@ -90,7 +90,7 @@ class _FakeSharedExecutor:
 
 
 class _FakeStrategy(nn.Module):
-    name = "mega"
+    name = "mega_moe"
 
     def __init__(self, cap: int) -> None:
         super().__init__()

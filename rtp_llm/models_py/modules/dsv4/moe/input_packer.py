@@ -17,7 +17,7 @@ from .quant_layouts import _per_token_cast_to_fp8_packed_ue8m0
 from .shared_expert import strict_fused_moe_enabled
 
 
-class MegaMoeInputPacker(ABC):
+class MegaMoEInputPacker(ABC):
     """Pack routed MegaMoE inputs into the DeepGEMM symm-mem buffer.
 
     The ``fused`` implementation follows the same math as DeepGEMM's
@@ -39,7 +39,7 @@ class MegaMoeInputPacker(ABC):
         raise NotImplementedError
 
 
-class TorchMegaMoeInputPacker(MegaMoeInputPacker):
+class TorchMegaMoEInputPacker(MegaMoEInputPacker):
     name = "torch"
 
     def pack(
@@ -52,7 +52,7 @@ class TorchMegaMoeInputPacker(MegaMoeInputPacker):
     ) -> None:
         if strict_fused_moe_enabled():
             raise RuntimeError(
-                "DSV4_MOE_STRICT_FUSED=1 forbids TorchMegaMoeInputPacker"
+                "DSV4_MOE_STRICT_FUSED=1 forbids TorchMegaMoEInputPacker"
             )
         safe_x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0).contiguous()
         x_fp8, x_sf = _per_token_cast_to_fp8_packed_ue8m0(safe_x, gran_k=32)
@@ -62,7 +62,7 @@ class TorchMegaMoeInputPacker(MegaMoeInputPacker):
         buf.topk_weights[:tokens].copy_(weights.to(torch.float32).contiguous())
 
 
-class FusedMegaMoeInputPacker(MegaMoeInputPacker):
+class FusedMegaMoEInputPacker(MegaMoEInputPacker):
     name = "fused"
 
     def pack(
@@ -96,16 +96,16 @@ def _mode() -> str:
     return os.environ.get("DSV4_MEGA_MOE_INPUT_PACKER", "fused").strip().lower()
 
 
-def get_mega_moe_input_packer() -> MegaMoeInputPacker:
+def get_mega_moe_input_packer() -> MegaMoEInputPacker:
     mode = _mode()
     if mode == "torch":
         if strict_fused_moe_enabled():
             raise RuntimeError(
                 "DSV4_MOE_STRICT_FUSED=1 forbids DSV4_MEGA_MOE_INPUT_PACKER=torch"
             )
-        return TorchMegaMoeInputPacker()
+        return TorchMegaMoEInputPacker()
     if mode in ("auto", "fused"):
-        return FusedMegaMoeInputPacker()
+        return FusedMegaMoEInputPacker()
     raise ValueError(
         f"invalid DSV4_MEGA_MOE_INPUT_PACKER={mode!r}; expected auto|torch|fused"
     )

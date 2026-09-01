@@ -120,6 +120,7 @@ class DeepSeekV4Weight(DeepSeekV2Weight):
         else:
             self._compress_ratios = self._compress_ratios[: self._num_layers]
         self._num_hash_layers = int(self.model_config.num_hash_layers)
+        self._n_shared_experts = int(self.model_config.n_shared_experts)
 
     def _compress_ratio(self, layer_id: int) -> int:
         if layer_id < 0 or layer_id >= len(self._compress_ratios):
@@ -311,6 +312,13 @@ class DeepSeekV4Weight(DeepSeekV2Weight):
         return out
 
     def _build_shared_expert(self, layer_id: int) -> List[WeightModule]:
+        if self._n_shared_experts == 0:
+            return []
+        if self._n_shared_experts != 1:
+            raise ValueError(
+                "DeepSeek-V4 currently supports at most one shared expert, "
+                f"got n_shared_experts={self._n_shared_experts}"
+            )
         cfg = self._v4_attn_cfg()
         return [
             AttnAtomicWeight(
@@ -694,9 +702,14 @@ class DeepSeekV4(DeepSeekV2):
         config.moe_n_group = 0
         config.moe_topk_group = 0
         config.has_moe_norm = config_json.get("norm_topk_prob", False)
-        config.moe_style = 2  # shared + expert
-        n_shared_experts = config_json["n_shared_experts"]
+        # Missing metadata means the checkpoint has no shared expert.  This
+        # keeps model-aware ``--moe_strategy auto`` usable for routed-only V4
+        # variants instead of failing config parsing before strategy selection.
+        n_shared_experts = int(config_json.get("n_shared_experts", 0) or 0)
+        config.moe_style = 2 if n_shared_experts > 0 else 1
+        config.n_shared_experts = int(n_shared_experts)
         config.inter_size = n_shared_experts * moe_intermediate_size
+        config.moe_inter_size = int(moe_intermediate_size)
         # Every layer is MoE in V4 (compress_ratios doesn't include dense replacement)
         config.moe_layer_index = list(range(config.num_layers))
 

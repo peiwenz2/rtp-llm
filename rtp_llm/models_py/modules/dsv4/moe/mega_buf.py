@@ -13,7 +13,6 @@ The cache key set MUST stay invariant across the refactor — see Phase 1 risk
 """
 
 import logging
-import os
 
 import torch
 
@@ -204,20 +203,3 @@ def _mega_moe_available() -> bool:
     for ``torch.distributed._symmetric_memory``, CUDA device SM100+, and
     an initialised world-size process group of size > 1."""
     return _mega_moe_unavailable_reason() is None
-
-
-def _mega_moe_enabled() -> bool:
-    """Default on when ``_mega_moe_available()`` holds.
-
-    ``DSV4_USE_MEGA_MOE=0`` disables Mega explicitly. EP>1 callers must treat
-    that as a configuration error rather than falling back to DeepEP.
-    """
-    if os.environ.get("DSV4_USE_MEGA_MOE", "1") == "0":
-        return False
-    return _mega_moe_available()
-
-
-def _mega_moe_disabled_or_unavailable_reason() -> str:
-    if os.environ.get("DSV4_USE_MEGA_MOE", "1") == "0":
-        return "DSV4_USE_MEGA_MOE=0 disables Mega MoE"
-    return _mega_moe_unavailable_reason() or "unknown Mega MoE availability failure"

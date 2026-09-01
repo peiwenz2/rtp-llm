@@ -241,6 +241,36 @@ def _build_positions_from_lengths(
     return prefix_lengths.gather(0, req_ids) + local_offsets
 
 
+def _resolve_prefill_cu_seqlens(
+    cu_seqlens: Optional[torch.Tensor],
+    input_lengths: torch.Tensor,
+    device: torch.device,
+) -> torch.Tensor:
+    """Return valid query boundaries for normal and warmup prefill calls.
+
+    The request path normally populates ``attn.cu_seqlens``. Startup real
+    warmup and some capture probes only provide per-request
+    ``input_lengths``; rebuild the equivalent ``[0, cumsum(lengths)]`` tensor
+    instead of passing the framework's empty placeholder into the strict FP8
+    varlen metadata builder.
+    """
+    if cu_seqlens is not None and cu_seqlens.numel() >= 2:
+        return cu_seqlens
+
+    lengths = input_lengths.to(device=device, dtype=torch.int32).reshape(-1)
+    if lengths.numel() == 0:
+        raise RuntimeError(
+            "DSV4 prefill requires cu_seqlens or non-empty input_lengths"
+        )
+    return torch.cat(
+        (
+            torch.zeros(1, dtype=torch.int32, device=device),
+            torch.cumsum(lengths, dim=0, dtype=torch.int32),
+        ),
+        dim=0,
+    ).contiguous()
+
+
 def _last_hidden_by_request(
     flat: torch.Tensor,
     cu_seqlens: Optional[torch.Tensor],
@@ -714,7 +744,11 @@ def forward_prefill(
     #    (the field the dev branch called ``position_ids``; it is only populated
     #    when the model declares a position-id length factor, so the synthesize
     #    branch below stays the live path for DSV4).
-    cu_seqlens = attn.cu_seqlens
+    cu_seqlens = _resolve_prefill_cu_seqlens(
+        attn.cu_seqlens,
+        attn.input_lengths,
+        input_ids.device,
+    )
     positions = getattr(attn, "combo_position_ids", None)
     # warmup / cudagraph capture path doesn't populate combo_position_ids —
     # synthesize from (prefix_lengths, input_lengths). Prefer ``_d`` (GPU)

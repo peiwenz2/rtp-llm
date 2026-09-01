@@ -50,12 +50,14 @@ def _bench(fn, warmup: int = 30, iters: int = 200) -> float:
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
-class MegaMoeInputPackerPerfTest(unittest.TestCase):
+class MegaMoEInputPackerPerfTest(unittest.TestCase):
     def _case(self, tokens: int, dim: int = 4096, topk: int = 6):
         torch.manual_seed(tokens)
         x = torch.randn(tokens, dim, device="cuda", dtype=torch.bfloat16) * 0.3
         weights = torch.randn(tokens, topk, device="cuda", dtype=torch.float32)
-        indices = torch.randint(0, 256, (tokens, topk), device="cuda", dtype=torch.int64)
+        indices = torch.randint(
+            0, 256, (tokens, topk), device="cuda", dtype=torch.int64
+        )
         ref = _make_buf(tokens, dim, topk, "cuda")
         got = _make_buf(tokens, dim, topk, "cuda")
 
@@ -72,7 +74,9 @@ class MegaMoeInputPackerPerfTest(unittest.TestCase):
         run_legacy()
         run_optimized()
         torch.cuda.synchronize()
-        self.assertTrue(torch.equal(ref.x.view(torch.uint8).cpu(), got.x.view(torch.uint8).cpu()))
+        self.assertTrue(
+            torch.equal(ref.x.view(torch.uint8).cpu(), got.x.view(torch.uint8).cpu())
+        )
         self.assertTrue(torch.equal(ref.x_sf.cpu(), got.x_sf.cpu()))
         self.assertTrue(torch.equal(ref.topk_idx.cpu(), got.topk_idx.cpu()))
         self.assertTrue(torch.equal(ref.topk_weights.cpu(), got.topk_weights.cpu()))
@@ -100,7 +104,9 @@ class MegaMoeInputPackerPerfTest(unittest.TestCase):
                     f"T={tokens}: optimized={optimized_ms * 1000:.2f}us, "
                     f"legacy={legacy_ms * 1000:.2f}us"
                 )
-        self.assertFalse(failures, "MegaMoE packer perf gate failed: " + "; ".join(failures))
+        self.assertFalse(
+            failures, "MegaMoE packer perf gate failed: " + "; ".join(failures)
+        )
 
 
 if __name__ == "__main__":

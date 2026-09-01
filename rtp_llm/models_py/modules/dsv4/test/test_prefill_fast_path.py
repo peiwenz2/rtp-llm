@@ -90,6 +90,7 @@ class _FakeV4:
         self._prefill_ws_idx_w = 0
         self._mtp_hidden_buffer = None
         self._mtp_last_hidden_buffer = None
+        self.capture_aux_hidden_layer_ids = ()
         self.norm = lambda h: h + 100
 
     def _propagate_cp_ctx(self, cp_ctx):
@@ -104,6 +105,36 @@ class _FakeV4:
 
 
 class PrefillFastPathTest(unittest.TestCase):
+    def test_prefill_cu_seqlens_keeps_framework_metadata(self):
+        existing = torch.tensor([0, 2, 5], dtype=torch.int32)
+
+        resolved = prefill_forward._resolve_prefill_cu_seqlens(
+            existing,
+            torch.tensor([9], dtype=torch.int32),
+            torch.device("cpu"),
+        )
+
+        self.assertIs(resolved, existing)
+
+    def test_prefill_cu_seqlens_rebuilt_for_startup_warmup(self):
+        resolved = prefill_forward._resolve_prefill_cu_seqlens(
+            torch.empty(0, dtype=torch.int32),
+            torch.tensor([2, 3], dtype=torch.int32),
+            torch.device("cpu"),
+        )
+
+        self.assertEqual(resolved.dtype, torch.int32)
+        self.assertTrue(resolved.is_contiguous())
+        torch.testing.assert_close(resolved, torch.tensor([0, 2, 5], dtype=torch.int32))
+
+    def test_prefill_cu_seqlens_requires_request_lengths(self):
+        with self.assertRaisesRegex(RuntimeError, "non-empty input_lengths"):
+            prefill_forward._resolve_prefill_cu_seqlens(
+                None,
+                torch.empty(0, dtype=torch.int32),
+                torch.device("cpu"),
+            )
+
     def test_disable_record_function_ranges_is_scoped(self):
         calls = []
 

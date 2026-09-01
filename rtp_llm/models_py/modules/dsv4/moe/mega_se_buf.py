@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import inspect
 import logging
-import os
 
 import torch
 
@@ -19,15 +18,8 @@ from .mega_buf import _mega_moe_unavailable_reason
 _MEGA_SE_BUF_CACHE: dict = {}
 _MEGA_SE_OUTPUT_CACHE: dict = {}
 
-_USE_MEGA_MOE_SE_ENV = "DSV4_USE_MEGA_MOE_SE"
 _NUM_SHARED_EXPERTS = 1
 _MMA_TYPE = "fp8xfp4"
-
-
-def mega_moe_se_requested() -> bool:
-    """Return whether the operator explicitly opted into fused SE execution."""
-
-    return os.environ.get(_USE_MEGA_MOE_SE_ENV, "0") == "1"
 
 
 def estimate_mega_moe_se_symm_buffer_bytes(
@@ -138,7 +130,7 @@ def _get_or_create_mega_se_buf(
     )
     if actual_bytes is not None and estimated_bytes is not None:
         logging.info(
-            "[DSV4 MegaMoE-SE] allocated symm buffer: group_size=%d "
+            "[DSV4 MegaMoESE] allocated symm buffer: group_size=%d "
             "num_experts=%d max_tokens_per_rank=%d topk=%d hidden=%d "
             "intermediate=%d shared=1 actual=%.3f GiB estimated=%.3f GiB",
             *details,
@@ -147,7 +139,7 @@ def _get_or_create_mega_se_buf(
         )
     elif actual_bytes is not None:
         logging.info(
-            "[DSV4 MegaMoE-SE] allocated symm buffer: group_size=%d "
+            "[DSV4 MegaMoESE] allocated symm buffer: group_size=%d "
             "num_experts=%d max_tokens_per_rank=%d topk=%d hidden=%d "
             "intermediate=%d shared=1 actual=%.3f GiB",
             *details,
@@ -155,7 +147,7 @@ def _get_or_create_mega_se_buf(
         )
     elif estimated_bytes is not None:
         logging.info(
-            "[DSV4 MegaMoE-SE] allocated symm buffer: group_size=%d "
+            "[DSV4 MegaMoESE] allocated symm buffer: group_size=%d "
             "num_experts=%d max_tokens_per_rank=%d topk=%d hidden=%d "
             "intermediate=%d shared=1 actual=unavailable estimated=%.3f GiB",
             *details,
@@ -195,8 +187,6 @@ def _mega_moe_se_unavailable_reason() -> str | None:
     base = _mega_moe_unavailable_reason()
     if base is not None:
         return base
-    if os.environ.get("DSV4_USE_MEGA_MOE", "1") == "0":
-        return "DSV4_USE_MEGA_MOE=0 disables the Mega MoE family"
     try:
         import deep_gemm
 
@@ -225,16 +215,3 @@ def _mega_moe_se_unavailable_reason() -> str | None:
 
 def _mega_moe_se_available() -> bool:
     return _mega_moe_se_unavailable_reason() is None
-
-
-def _mega_moe_se_enabled() -> bool:
-    return mega_moe_se_requested() and _mega_moe_se_available()
-
-
-def _mega_moe_se_disabled_or_unavailable_reason() -> str:
-    if not mega_moe_se_requested():
-        return f"{_USE_MEGA_MOE_SE_ENV} is not set to 1"
-    return (
-        _mega_moe_se_unavailable_reason()
-        or "unknown Mega MoE fused-SE availability failure"
-    )

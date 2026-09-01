@@ -21,12 +21,6 @@ _REPO = os.path.abspath(os.path.join(_THIS, "..", "..", "..", "..", ".."))
 if _REPO not in sys.path:
     sys.path.insert(0, _REPO)
 
-# Force grouped-FP4 opt-in BEFORE importing the moe module so the
-# ``_has_fp8_fp4_grouped_kernel`` probe (called at decorator-evaluation
-# time below) sees the env gate as enabled.  Without this the test would
-# always skip because the production default keeps the path opt-in.
-os.environ.setdefault("DSV4_USE_GROUPED_FP4", "1")
-
 from rtp_llm.models_py.kernels.cuda.deepgemm_wrapper import has_deep_gemm
 from rtp_llm.models_py.modules.dsv4.moe import MoE, _has_fp8_fp4_grouped_kernel
 

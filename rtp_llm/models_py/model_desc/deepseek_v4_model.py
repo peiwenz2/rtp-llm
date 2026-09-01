@@ -56,8 +56,8 @@ from rtp_llm.models_py.modules.dsv4.moe.moe_layer import (
 )
 from rtp_llm.models_py.modules.dsv4.prefill.forward import forward_prefill
 from rtp_llm.models_py.modules.dsv4.transformer import V4Args, V4Transformer
-from rtp_llm.utils.warmup import model_warm_up_enabled
 from rtp_llm.ops import RoleType
+from rtp_llm.utils.warmup import model_warm_up_enabled
 
 
 def _materialize_meta_buffers(module: torch.nn.Module, device: str) -> int:
@@ -257,13 +257,13 @@ def _args_from_model_config(
         index_n_heads=attn_config.indexer_head_num,
         index_head_dim=attn_config.indexer_head_dim,
         index_topk=attn_config.indexer_topk,
-        moe_inter_dim=(
-            model_config.inter_size // max(1, model_config.moe_k or 1)
-            if False
-            else model_config.inter_size // 1
+        moe_inter_dim=int(model_config.moe_inter_size)
+        or (
+            int(model_config.inter_size)
+            // max(int(getattr(model_config, "n_shared_experts", 0)), 1)
         ),
         n_routed_experts=model_config.expert_num,
-        n_shared_experts=1,
+        n_shared_experts=int(getattr(model_config, "n_shared_experts", 0)),
         n_activated_experts=model_config.moe_k,
         score_func={0: "softmax", 1: "sigmoid", 2: "sqrtsoftplus"}[
             model_config.scoring_func
@@ -316,6 +316,7 @@ class DeepSeekV4Model(GptModelBase):
 
         # Build V4Transformer with matching args.
         args = _args_from_model_config(model_config, max_generate_batch_size)
+        args.moe_strategy = str(getattr(moe_config, "moe_strategy", "auto") or "auto")
         self._max_generate_batch_size = int(max_generate_batch_size)
         assert self._max_generate_batch_size > 0, (
             "max_generate_batch_size must be positive, "
@@ -348,8 +349,11 @@ class DeepSeekV4Model(GptModelBase):
         ):
             args.moe_inter_dim = int(moe_config.moe_inter_padding_size)
         else:
-            # V4-Flash = 2048. config.inter_size = n_shared * 2048 = 2048 (since n_shared=1).
-            args.moe_inter_dim = int(model_config.inter_size) or args.moe_inter_dim
+            args.moe_inter_dim = (
+                int(model_config.moe_inter_size)
+                or int(model_config.inter_size)
+                or args.moe_inter_dim
+            )
 
         # S7 scaffold: thread the framework's parallelism config into V4Args.
         # No behavior change at TP=1; the fields are read by future patches
@@ -826,7 +830,10 @@ class DeepSeekV4Model(GptModelBase):
                 import torch.distributed as _dist
 
                 _strategy = self.v4.layers[0].ffn._strategy
-                if getattr(_strategy, "name", "") in ("mega", "mega_se"):
+                if getattr(_strategy, "name", "") in (
+                    "mega_moe",
+                    "mega_moe_se",
+                ):
                     if _dist.is_available() and _dist.is_initialized():
                         _dist.barrier()
                     _cfg = _strategy.cfg

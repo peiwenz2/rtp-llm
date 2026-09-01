@@ -1,4 +1,4 @@
-"""DeepSeek-V4 MoE block: routed top-k experts + 1 shared expert.
+"""DeepSeek-V4 MoE block: routed top-k experts with optional shared expert.
 
 This orchestrator owns:
   - ``self.gate``: ``Gate`` module (routing scores → topk)
@@ -206,7 +206,11 @@ class MoE(nn.Module):
             vocab_size,
             layer_weights=layer_weights,
         )
-        assert n_shared_experts == 1, "V4 always has exactly 1 shared expert"
+        assert n_shared_experts in (0, 1), (
+            "DeepSeek-V4 currently supports zero or one shared expert, got "
+            f"n_shared_experts={n_shared_experts}"
+        )
+        self.n_shared_experts = int(n_shared_experts)
 
         # --- Strategy selection ---
         cfg = MoeCfg(
@@ -215,6 +219,7 @@ class MoE(nn.Module):
             moe_inter_dim=moe_inter_dim,
             n_routed_experts=n_routed_experts,
             n_activated_experts=n_activated_experts,
+            n_shared_experts=n_shared_experts,
             swiglu_limit=swiglu_limit,
             ep_size=ep_size,
             ep_rank=ep_rank,
@@ -226,16 +231,20 @@ class MoE(nn.Module):
         forced, strict = _resolve_forced(strategy)
         strategy_cls = select_strategy(cfg, forced=forced, strict=strict)
         # Strategies that fold the shared expert into their routed kernel
-        # (MegaMoEFusedStrategy / MegaMoEStrategySE) own the shared-expert
+        # (currently MegaMoESEStrategy) own the shared-expert
         # weights themselves and produce ``routed + shared`` directly; the
         # MoE layer then skips its standalone shared-expert executor and the
         # combine add.
         self._routed_includes_shared = bool(
             getattr(strategy_cls, "routed_includes_shared", False)
         )
+        self._skip_shared_expert = (
+            self._routed_includes_shared or self.n_shared_experts == 0
+        )
 
-        if self._routed_includes_shared:
-            # The fused strategy pops + owns W.v4_shared_* in setup_weights.
+        if self._skip_shared_expert:
+            # A fused-SE strategy owns W.v4_shared_*. A model without shared
+            # experts has no shared weights or executor to construct.
             self.shared_experts = None
             self._shared_executor = None
         else:
@@ -271,6 +280,21 @@ class MoE(nn.Module):
         self._strategy._gate_pack_route_scale = float(self.gate.route_scale)
         self._strategy.setup_weights(layer_weights)
 
+    def _shared_execution_skipped(self) -> bool:
+        """Whether the strategy output needs no standalone shared-expert add.
+
+        The fallback keeps lightweight tests and diagnostics that construct a
+        ``MoE`` instance without calling ``__init__`` compatible with the
+        pre-existing ``_routed_includes_shared`` contract.
+        """
+        return bool(
+            getattr(
+                self,
+                "_skip_shared_expert",
+                getattr(self, "_routed_includes_shared", False),
+            )
+        )
+
     def _should_chunk(self, tokens: int) -> bool:
         max_tokens = int(self.max_tokens_per_rank)
         assert max_tokens > 0, f"max_tokens_per_rank must be positive, got {max_tokens}"
@@ -298,7 +322,7 @@ class MoE(nn.Module):
         out: torch.Tensor,
     ) -> None:
         if self._gate_pack_static:
-            if self._routed_includes_shared:
+            if self._shared_execution_skipped():
                 with record_function_range("dsv4.moe.routed_experts"):
                     routed = self._strategy.forward_with_gate_pack(
                         x, self.gate, input_ids
@@ -329,8 +353,8 @@ class MoE(nn.Module):
         with record_function_range("dsv4.moe.gate"):
             weights, indices = self.gate(x, input_ids)
 
-        if self._routed_includes_shared:
-            # Fused strategy returns ``routed + shared`` directly.
+        if self._shared_execution_skipped():
+            # The strategy output is already final when shared execution is skipped.
             with record_function_range("dsv4.moe.routed_experts"):
                 routed = self._strategy(x, weights, indices)
             out.copy_(routed)
@@ -423,7 +447,7 @@ class MoE(nn.Module):
             return self._forward_chunked(x, input_ids_flat, shape)
 
         if self._gate_pack_static:
-            if self._routed_includes_shared:
+            if self._shared_execution_skipped():
                 with record_function_range("dsv4.moe.routed_experts"):
                     y = self._strategy.forward_with_gate_pack(
                         x, self.gate, input_ids_flat
@@ -487,8 +511,8 @@ class MoE(nn.Module):
                     indices[dbg_pos_mask].contiguous(),
                 )
 
-        if self._routed_includes_shared:
-            # Fused strategy: the kernel already produced ``routed + shared``.
+        if self._shared_execution_skipped():
+            # The strategy output is already final when shared execution is skipped.
             with record_function_range("dsv4.moe.routed_experts"):
                 y = self._strategy(x, weights, indices)
             if _dbg:

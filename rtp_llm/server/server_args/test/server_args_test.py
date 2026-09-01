@@ -15,6 +15,15 @@ from rtp_llm.utils.backend_registry import (
 class ServerArgsPyEnvConfigsTest(TestCase):
     """Test that environment variables and command line arguments are correctly set to py_env_configs structure."""
 
+    def test_dsv4_mega_moe_public_choices(self):
+        from rtp_llm.server.server_args import server_args
+
+        with patch.dict(os.environ, {}, clear=True):
+            nonse = server_args.setup_args(["--moe_strategy", "mega_moe"])
+            fused_se = server_args.setup_args(["--moe_strategy", "mega_moe_se"])
+        self.assertEqual(nonse.moe_config.moe_strategy, "mega_moe")
+        self.assertEqual(fused_se.moe_config.moe_strategy, "mega_moe_se")
+
     def test_internal_backend_registers_moe_choice_before_parser_initialization(self):
         from rtp_llm.server.server_args import server_args
 

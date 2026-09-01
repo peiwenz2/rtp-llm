@@ -77,22 +77,22 @@ def stage_mega_moe_se_shared_l1_scales(
     block_m = int(block_m)
     if source.dtype != torch.int32 or destination.dtype != torch.int32:
         raise TypeError(
-            "MegaMoE-SE activation scales must be int32; "
+            "MegaMoESE activation scales must be int32; "
             f"got source={source.dtype}, destination={destination.dtype}"
         )
     if not source.is_cuda or not destination.is_cuda:
-        raise RuntimeError("MegaMoE-SE scale staging requires CUDA tensors")
+        raise RuntimeError("MegaMoESE scale staging requires CUDA tensors")
     if source.dim() != 2 or destination.dim() != 2:
-        raise ValueError("MegaMoE-SE scale tensors must both be rank 2")
+        raise ValueError("MegaMoESE scale tensors must both be rank 2")
     if tokens < 0 or tokens > source.size(0):
         raise ValueError(f"invalid tokens={tokens} for source rows={source.size(0)}")
     if source.size(1) != destination.size(1):
         raise ValueError(
-            "MegaMoE-SE packed scale width mismatch: "
+            "MegaMoESE packed scale width mismatch: "
             f"source={source.size(1)}, destination={destination.size(1)}"
         )
     if block_m <= 0:
-        raise ValueError(f"MegaMoE-SE BLOCK_M must be positive, got {block_m}")
+        raise ValueError(f"MegaMoESE BLOCK_M must be positive, got {block_m}")
     if tokens == 0:
         return
 
@@ -100,7 +100,7 @@ def stage_mega_moe_se_shared_l1_scales(
     active_rows = ((tokens + block_m - 1) // block_m) * aligned_block_m
     if active_rows > destination.size(0):
         raise RuntimeError(
-            "MegaMoE-SE shared scale buffer is too small: "
+            "MegaMoESE shared scale buffer is too small: "
             f"need rows={active_rows}, have rows={destination.size(0)}, "
             f"tokens={tokens}, block_m={block_m}"
         )

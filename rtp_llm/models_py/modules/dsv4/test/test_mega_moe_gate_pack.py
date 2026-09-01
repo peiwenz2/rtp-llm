@@ -66,7 +66,7 @@ def _assert_buf_equal(test: unittest.TestCase, ref, got) -> None:
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
-class MegaMoeGatePackTest(unittest.TestCase):
+class MegaMoEGatePackTest(unittest.TestCase):
     def setUp(self) -> None:
         torch.manual_seed(11)
         torch.cuda.set_device(0)

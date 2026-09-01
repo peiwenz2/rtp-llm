@@ -1,9 +1,8 @@
 """DeepGEMM Mega MoE strategy with the FP8 shared expert fused in-kernel.
 
 The installed DeepGEMM API uses the ordinary ``fp8_fp4_mega_moe`` symbol with
-optional shared weights.  This strategy is opt-in via
-``DSV4_USE_MEGA_MOE_SE=1`` and owns independent buffer/packer/warmup state so
-the default routed-only Mega path is unchanged.
+optional shared weights. The public ``mega_moe_se`` strategy owns independent
+buffer/packer/warmup state from the routed-only ``mega_moe`` path.
 """
 
 from __future__ import annotations
@@ -20,7 +19,7 @@ from ...quant_layouts import FP4_BLOCK, prepare_fp4_weight_scale_for_deepgemm
 from ..mega_se_buf import (
     _get_or_create_mega_se_buf,
     _get_or_create_mega_se_output,
-    _mega_moe_se_enabled,
+    _mega_moe_se_available,
 )
 from ..mega_se_input_packer import get_mega_moe_se_input_packer
 from ..mega_se_jit_warmup import (
@@ -76,15 +75,17 @@ def _get_mega_se_gate_pack_kernels():
 
 
 @register_strategy
-class MegaMoEStrategySE(MegaMoEStrategy):
+class MegaMoESEStrategy(MegaMoEStrategy):
     """Run routed FP4 experts and the replicated FP8 shared expert together."""
 
-    name = "mega_se"
+    name = "mega_moe_se"
     routed_includes_shared = True
 
     @classmethod
     def can_handle(cls, cfg: MoeCfg) -> bool:
-        return cfg.ep_size > 1 and _mega_moe_se_enabled()
+        return (
+            cfg.ep_size > 1 and cfg.n_shared_experts == 1 and _mega_moe_se_available()
+        )
 
     def setup_weights(self, layer_weights: Dict) -> None:
         import deep_gemm
@@ -181,17 +182,17 @@ class MegaMoEStrategySE(MegaMoEStrategy):
         expected_w2 = (D, inter)
         if tuple(w13_fp8.shape) != expected_w13:
             raise RuntimeError(
-                "MegaMoE-SE shared w13 weight shape mismatch: "
+                "MegaMoESE shared w13 weight shape mismatch: "
                 f"got {tuple(w13_fp8.shape)}, expected {expected_w13}"
             )
         if tuple(w2_fp8.shape) != expected_w2:
             raise RuntimeError(
-                "MegaMoE-SE shared w2 weight shape mismatch: "
+                "MegaMoESE shared w2 weight shape mismatch: "
                 f"got {tuple(w2_fp8.shape)}, expected {expected_w2}"
             )
         if w13_fp8.dtype != torch.float8_e4m3fn or w2_fp8.dtype != torch.float8_e4m3fn:
             raise TypeError(
-                "MegaMoE-SE shared weights must be float8_e4m3fn; "
+                "MegaMoESE shared weights must be float8_e4m3fn; "
                 f"got w13={w13_fp8.dtype}, w2={w2_fp8.dtype}"
             )
 
@@ -217,7 +218,7 @@ class MegaMoEStrategySE(MegaMoEStrategy):
             return scale
         if scale.dtype != torch.float8_e8m0fnu:
             raise TypeError(
-                "MegaMoE-SE expected shared UE8M0 scale, " f"got {scale.dtype}"
+                "MegaMoESE expected shared UE8M0 scale, " f"got {scale.dtype}"
             )
         return deep_gemm.transform_sf_into_required_layout(
             scale.float(), mn, k, _SHARED_RECIPE[1:], num_groups=None
@@ -258,7 +259,7 @@ class MegaMoEStrategySE(MegaMoEStrategy):
             return
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
-                "MegaMoE-SE JIT warmup must not run inside CUDA graph capture"
+                "MegaMoESE JIT warmup must not run inside CUDA graph capture"
             )
 
         import deep_gemm
@@ -270,7 +271,7 @@ class MegaMoEStrategySE(MegaMoEStrategy):
         if not token_counts:
             return
         warmup_key = (
-            "mega_se",
+            "mega_moe_se",
             cfg.ep_size,
             cfg.n_routed_experts,
             cfg.n_local_experts,
@@ -295,7 +296,7 @@ class MegaMoEStrategySE(MegaMoEStrategy):
         rank = dist.get_rank() if dist.is_initialized() else 0
         if rank == 0:
             logging.info(
-                "[DSV4 MegaMoE-SE] JIT warmup start: layer=%d tokens=[%s] "
+                "[DSV4 MegaMoESE] JIT warmup start: layer=%d tokens=[%s] "
                 "max_tokens_per_rank=%d ep=%d experts=%d topk=%d hidden=%d "
                 "intermediate=%d num_sms=%d shared_recipe=%s",
                 cfg.layer_id,
@@ -312,14 +313,14 @@ class MegaMoEStrategySE(MegaMoEStrategy):
         tmpdir, previous_tmpdir = _activate_mega_moe_rank_nvcc_tmpdir(rank)
         try:
             if rank == 0:
-                logging.info("[DSV4 MegaMoE-SE] rank-local nvcc TMPDIR=%s", tmpdir)
+                logging.info("[DSV4 MegaMoESE] rank-local nvcc TMPDIR=%s", tmpdir)
             self.warmup_jit(token_counts)
         finally:
             _restore_tmpdir(previous_tmpdir)
         _MEGA_MOE_SE_JIT_WARMED_KEYS.add(warmup_key)
         if rank == 0:
             logging.info(
-                "[DSV4 MegaMoE-SE] JIT warmup done: layer=%d tokens=[%s]",
+                "[DSV4 MegaMoESE] JIT warmup done: layer=%d tokens=[%s]",
                 cfg.layer_id,
                 format_token_counts(token_counts),
             )
@@ -448,7 +449,7 @@ class MegaMoEStrategySE(MegaMoEStrategy):
         kernels = _get_mega_se_gate_pack_kernels()
         if kernels is None:
             raise RuntimeError(
-                "MegaMoE-SE gate-pack was selected but kernels are unavailable"
+                "MegaMoESE gate-pack was selected but kernels are unavailable"
             )
         pack_nonhash, pack_hash, _ = kernels
         tokens = x.size(0)
@@ -495,4 +496,4 @@ class MegaMoEStrategySE(MegaMoEStrategy):
         return y
 
 
-__all__ = ["MegaMoEStrategySE"]
+__all__ = ["MegaMoESEStrategy"]

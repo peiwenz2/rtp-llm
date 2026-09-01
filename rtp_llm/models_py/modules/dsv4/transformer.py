@@ -55,6 +55,7 @@ class V4Args:
     moe_inter_dim: int = 2048
     n_routed_experts: int = 256
     n_shared_experts: int = 1
+    moe_strategy: str = "auto"
     n_activated_experts: int = 6
     score_func: str = "sqrtsoftplus"
     route_scale: float = 1.5
@@ -133,6 +134,7 @@ def _block_kwargs(
         n_routed_experts=args.n_routed_experts,
         n_activated_experts=args.n_activated_experts,
         n_shared_experts=args.n_shared_experts,
+        moe_strategy=args.moe_strategy,
         score_func=args.score_func,
         route_scale=args.route_scale,
         swiglu_limit=args.swiglu_limit,

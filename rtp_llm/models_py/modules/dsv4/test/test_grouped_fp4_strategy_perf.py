@@ -22,6 +22,7 @@ def _cfg(E: int, D: int, inter: int, topk: int, tokens: int) -> MoeCfg:
         moe_inter_dim=inter,
         n_routed_experts=E,
         n_activated_experts=topk,
+        n_shared_experts=1,
         swiglu_limit=10.0,
         ep_size=1,
         ep_rank=0,

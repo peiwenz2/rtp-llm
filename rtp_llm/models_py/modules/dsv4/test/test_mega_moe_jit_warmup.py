@@ -55,9 +55,9 @@ from rtp_llm.models_py.modules.dsv4.moe.mega_jit_warmup import (
 )
 from rtp_llm.models_py.modules.dsv4.moe.strategies.base import MoeCfg
 from rtp_llm.models_py.modules.dsv4.moe.strategies.mega import (
+    _MEGA_MOE_JIT_WARMED_KEYS,
     MegaMoEStrategy,
     _activate_mega_moe_rank_nvcc_tmpdir,
-    _MEGA_MOE_JIT_WARMED_KEYS,
     _mega_moe_rank_nvcc_tmpdir,
     _restore_tmpdir,
 )
@@ -110,6 +110,7 @@ class MegaMoEJitWarmupTest(unittest.TestCase):
             moe_inter_dim=2048,
             n_routed_experts=256,
             n_activated_experts=6,
+            n_shared_experts=1,
             swiglu_limit=7.0,
             ep_size=8,
             ep_rank=5,
