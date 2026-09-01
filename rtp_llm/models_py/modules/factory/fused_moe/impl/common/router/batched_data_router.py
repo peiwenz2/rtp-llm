@@ -113,15 +113,20 @@ class BatchedDataRouter(FusedMoeDataRouter):
         )
         token_indices = token_indices[:num_experts]
         expert_num_tokens = match[:, :num_experts].sum(0, dtype=torch.int32)
-        self._packed_rows = packed_rows
-        self._routed = routed
-
-        return ExpertForwardPayload(
-            expert_x=a1[token_indices],
+        expert_x = a1[token_indices]
+        payload = ExpertForwardPayload(
+            expert_x=expert_x,
             expert_tokens_meta=ExpertTokensMetadata(
                 expert_num_tokens=expert_num_tokens
             ),
         )
+        self._packed_rows = packed_rows
+        self._routed = routed
+        return payload
+
+    def abort_forward(self) -> None:
+        self._packed_rows = None
+        self._routed = None
 
     def finalize(
         self,
@@ -148,8 +153,7 @@ class BatchedDataRouter(FusedMoeDataRouter):
         # Payload shape is validated above, so it stays retryable; past this point
         # the plan is spent either way, or a failed collective would wedge
         # prepare() into rejecting every later call.
-        self._packed_rows = None
-        self._routed = None
+        self.abort_forward()
         rows = (
             expert_output.reshape(-1, hidden_dim)
             .index_select(0, packed_rows.reshape(-1))

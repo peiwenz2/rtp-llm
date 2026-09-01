@@ -70,6 +70,10 @@ class BatchedTritonExperts(FusedMoeExpertExecutor):
         apply_router_weight_on_input: bool,
         extra_expert_args: Optional[dict[str, Any]],
     ) -> CombineForwardPayload:
+        if expert_map is not None:
+            raise NotImplementedError(
+                "BatchedTritonExperts does not support expert_map"
+            )
         if apply_router_weight_on_input:
             raise NotImplementedError(
                 "BatchedTritonExperts cannot weight the input; BatchedDataRouter."

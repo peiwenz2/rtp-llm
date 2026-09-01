@@ -148,7 +148,11 @@ class FusedMoeDataRouter(ABC):
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
     ) -> ExpertForwardPayload:
+        """Prepare routing state, publishing it only when this call succeeds."""
         raise NotImplementedError
+
+    def abort_forward(self) -> None:
+        """Discard state published by a failed forward. This method must not raise."""
 
     @abstractmethod
     def finalize(
@@ -261,62 +265,65 @@ class FusedMoe(torch.nn.Module):
             topk_weights,
             topk_ids,
         )
+        try:
+            if expert_payload.expert_topk_ids is None:
+                expert_payload.expert_topk_ids = topk_ids
+            if expert_payload.expert_topk_weights is None:
+                expert_payload.expert_topk_weights = topk_weights
 
-        if expert_payload.expert_topk_ids is None:
-            expert_payload.expert_topk_ids = topk_ids
-        if expert_payload.expert_topk_weights is None:
-            expert_payload.expert_topk_weights = topk_weights
-
-        if expert_payload.expert_x.numel() == 0:
-            # This happens when none of the tokens from the all2all reach this
-            # EP rank. Also, note that this is only relevant for CUDAGraph
-            # incompatible all2all kernels like the DeepEP high-throughput
-            # kernels. CUDAGraph compatible all2all kernels like the pplx
-            # kernels and the DeepEP low-latency kernels are always batched
-            # and can never run into the tensor.numel() == 0 case.
-            combine_payload = CombineForwardPayload(
-                fused_expert_output=torch.empty_like(
-                    expert_payload.expert_x, dtype=a1.dtype
+            if expert_payload.expert_x.numel() == 0:
+                # This happens when none of the tokens from the all2all reach this
+                # EP rank. Also, note that this is only relevant for CUDAGraph
+                # incompatible all2all kernels like the DeepEP high-throughput
+                # kernels. CUDAGraph compatible all2all kernels like the pplx
+                # kernels and the DeepEP low-latency kernels are always batched
+                # and can never run into the tensor.numel() == 0 case.
+                combine_payload = CombineForwardPayload(
+                    fused_expert_output=torch.empty_like(
+                        expert_payload.expert_x, dtype=a1.dtype
+                    )
                 )
-            )
-        else:
-            combine_payload = self.fused_experts.execute(
-                expert_payload,
-                activation=activation,
-                expert_map=expert_map,
-                a2_scale=a2_scale,
-                apply_router_weight_on_input=apply_router_weight_on_input,
-                extra_expert_args=extra_expert_args,
-            )
+            else:
+                combine_payload = self.fused_experts.execute(
+                    expert_payload,
+                    activation=activation,
+                    expert_map=expert_map,
+                    a2_scale=a2_scale,
+                    apply_router_weight_on_input=apply_router_weight_on_input,
+                    extra_expert_args=extra_expert_args,
+                )
 
-        # Finalize arguments are a private per-call protocol. Copy caller
-        # input before adding derived values so a reusable dict cannot retain
-        # state from a previous forward.
-        finalize_args: FinalizeArgs = {
-            **(extra_finalize_args or {}),
-            "a1_shape": a1.shape,
-        }
-
-        # Pure-TP routers normally reduce their routed output in finalize().
-        # GenericMoeLayer can set this flag to combine routed and shared-expert
-        # partial outputs first, reducing the number of small TP collectives.
-        finalize_args.update(
-            {
-                "original_num_tokens": hidden_states.size(0),
-                SKIP_TP_ALLREDUCE_ARG: skip_tp_allreduce,
+            # Finalize arguments are a private per-call protocol. Copy caller
+            # input before adding derived values so a reusable dict cannot retain
+            # state from a previous forward.
+            finalize_args: FinalizeArgs = {
+                **(extra_finalize_args or {}),
+                "a1_shape": a1.shape,
             }
-        )
 
-        output = self.router.finalize(
-            combine_payload,
-            expert_payload.expert_topk_weights,
-            expert_payload.expert_topk_ids,
-            apply_router_weight_on_input,
-            finalize_args,
-        )
+            # Pure-TP routers normally reduce their routed output in finalize().
+            # GenericMoeLayer can set this flag to combine routed and shared-expert
+            # partial outputs first, reducing the number of small TP collectives.
+            finalize_args.update(
+                {
+                    "original_num_tokens": hidden_states.size(0),
+                    SKIP_TP_ALLREDUCE_ARG: skip_tp_allreduce,
+                }
+            )
 
-        assert (
-            output.shape == hidden_states.shape
-        ), f"output batch size mismatch: expected {hidden_states.shape}, got {output.shape}"
+            output = self.router.finalize(
+                combine_payload,
+                expert_payload.expert_topk_weights,
+                expert_payload.expert_topk_ids,
+                apply_router_weight_on_input,
+                finalize_args,
+            )
 
-        return output
+            assert (
+                output.shape == hidden_states.shape
+            ), f"output batch size mismatch: expected {hidden_states.shape}, got {output.shape}"
+
+            return output
+        except BaseException:
+            self.router.abort_forward()
+            raise

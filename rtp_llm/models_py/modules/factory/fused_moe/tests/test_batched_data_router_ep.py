@@ -9,10 +9,14 @@ from rtp_llm.models_py.distributed.collective_torch import Group
 from rtp_llm.models_py.modules.factory.fused_moe.defs import config_adapter
 from rtp_llm.models_py.modules.factory.fused_moe.defs import fused_moe as moe_defs
 from rtp_llm.models_py.modules.factory.fused_moe.defs import quant_config
+from rtp_llm.models_py.modules.factory.fused_moe.impl.common.executor.batched_triton_executor import (
+    BatchedTritonExperts,
+)
 from rtp_llm.models_py.modules.factory.fused_moe.impl.common.router import (
     batched_data_router,
 )
 from rtp_llm.ops import MoeConfig, ParallelismConfig
+from rtp_llm.utils.model_weight import W
 
 EXPERT_NUM = 8
 TP_SIZE = 2
@@ -30,7 +34,7 @@ class BatchedDataRouterEpTest(unittest.TestCase):
     real mask over the scratch column and over finalize's zeroing."""
 
     @staticmethod
-    def _make_router(max_tokens: int) -> batched_data_router.BatchedDataRouter:
+    def _make_config(max_tokens: int) -> config_adapter.MoEConfigAdapter:
         model_config = ModelConfig()
         model_config.hidden_size = HIDDEN
         model_config.expert_num = EXPERT_NUM
@@ -41,12 +45,16 @@ class BatchedDataRouterEpTest(unittest.TestCase):
         parallelism.ep_rank = EP_RANK
         moe_config = MoeConfig()
         moe_config.ll_num_max_token = max_tokens
+        return config_adapter.MoEConfigAdapter(
+            model_config=model_config,
+            parallelism_config=parallelism,
+            moe_config=moe_config,
+        )
+
+    @classmethod
+    def _make_router(cls, max_tokens: int) -> batched_data_router.BatchedDataRouter:
         return batched_data_router.BatchedDataRouter(
-            config=config_adapter.MoEConfigAdapter(
-                model_config=model_config,
-                parallelism_config=parallelism,
-                moe_config=moe_config,
-            ),
+            config=cls._make_config(max_tokens),
             quant_config=quant_config.FusedMoEQuantConfig(quant_dtype=None),
         )
 
@@ -136,6 +144,55 @@ class BatchedDataRouterEpTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, r"prepare\(\) called before"):
             self._prepare(self.a1, self.topk_weights, self.topk_ids)
         self._finalize(torch.zeros(LOCAL_EXPERTS, NUM_TOKENS, HIDDEN))
+
+    def test_executor_failure_does_not_poison_router(self) -> None:
+        router = self._make_router(NUM_TOKENS)
+        experts = BatchedTritonExperts(
+            self._make_config(NUM_TOKENS),
+            quant_config.FusedMoEQuantConfig(quant_dtype=None),
+            {
+                W.moe_w1: torch.empty(LOCAL_EXPERTS, 8, HIDDEN),
+                W.moe_w2: torch.empty(LOCAL_EXPERTS, HIDDEN, 4),
+            },
+        )
+        fused_moe = moe_defs.FusedMoe(router, experts, EXPERT_NUM)
+
+        with self.assertRaisesRegex(NotImplementedError, "expert_map"):
+            fused_moe(
+                self.a1,
+                self.topk_weights,
+                self.topk_ids,
+                expert_map=torch.arange(EXPERT_NUM),
+            )
+
+        payload = router.prepare(self.a1, None, None, self.topk_weights, self.topk_ids)
+        with mock.patch.object(
+            batched_data_router, "all_reduce", side_effect=lambda t, _g: t
+        ):
+            out = router.finalize(
+                moe_defs.CombineForwardPayload(
+                    fused_expert_output=payload.expert_x.clone()
+                ),
+                self.topk_weights,
+                self.topk_ids,
+                False,
+                None,
+            )
+
+        expected = self.a1 * (self.local * self.topk_weights).sum(1, keepdim=True)
+        torch.testing.assert_close(out, expected)
+
+    def test_rejected_reentrant_forward_does_not_discard_the_active_plan(self) -> None:
+        experts = mock.Mock(spec=moe_defs.FusedMoeExpertExecutor)
+        fused_moe = moe_defs.FusedMoe(self.router, experts, EXPERT_NUM)
+
+        with self.assertRaisesRegex(RuntimeError, r"prepare\(\) called before"):
+            fused_moe(self.a1, self.topk_weights, self.topk_ids)
+
+        out = self._finalize(self.payload.expert_x.clone())
+        experts.execute.assert_not_called()
+        expected = self.a1 * (self.local * self.topk_weights).sum(1, keepdim=True)
+        torch.testing.assert_close(out, expected)
 
     def test_round_trip_matches_reference_across_token_counts(self) -> None:
         """The fixed 6-token fixture cannot catch an off-by-one that only shows
