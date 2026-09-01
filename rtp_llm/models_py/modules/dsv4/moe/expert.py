@@ -46,9 +46,9 @@ class Expert(nn.Module):
     built through ``LinearFactory`` → ``CudaFp8DeepGEMMLinear``.  Forward
     flattens 3D inputs to 2D for the strategy's GEMM.
 
-    Factory mode (routed expert, ``storage="fp4"``): for now the expert
-    keeps ``QuantizedLinear`` and its forward still dequants per call;
-    S4 replaces the routed-expert loop with a single grouped
+    Factory mode (routed expert, ``storage="fp4"``): the expert keeps
+    ``QuantizedLinear``, whose forward uses native FP8 x FP4 GEMM.
+    Higher-throughput strategies replace the routed-expert loop with a grouped
     ``m_grouped_fp8_fp4_gemm_nt_*`` call via ``MoeStrategy``.
     """
 
@@ -69,7 +69,9 @@ class Expert(nn.Module):
         # storage="fp4" → QuantizedLinear with bound weight/scale (accepts N-D).
         self._uses_fp8_linear = storage == "fp8"
 
-        assert expert_weights is not None, "Expert requires expert_weights (descriptor path)"
+        assert (
+            expert_weights is not None
+        ), "Expert requires expert_weights (descriptor path)"
 
         if self._uses_fp8_linear:
             from rtp_llm.models_py.modules.dsv4.utils import _v4_fp8_linear
@@ -78,9 +80,8 @@ class Expert(nn.Module):
             self.w2 = _v4_fp8_linear(expert_weights["w2_w"], expert_weights["w2_s"])
             self.w3 = _v4_fp8_linear(expert_weights["w3_w"], expert_weights["w3_s"])
         else:
-            # Legacy storage="fp4" — bind weight + scale directly from
-            # the framework tensors; forward still dequants on the fly
-            # (until S4 swaps to grouped GEMM).
+            # Legacy storage="fp4": bind weight and scale directly from the
+            # framework tensors; QuantizedLinear executes native DeepGEMM.
             self.w1 = QuantizedLinear(dim, inter_dim, storage=storage)  # gate
             self.w2 = QuantizedLinear(inter_dim, dim, storage=storage)  # down
             self.w3 = QuantizedLinear(dim, inter_dim, storage=storage)  # up

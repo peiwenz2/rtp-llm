@@ -2,7 +2,7 @@
 
 This fuses the hot pre-Mega chain: BF16 activation -> FP8 E4M3, packed UE8M0
 group-32 scales, and router tensor copies into DeepGEMM's symmetric-memory
-dispatch buffer.  It mirrors ``_per_token_cast_to_fp8_packed_ue8m0`` but writes
+dispatch buffer. It mirrors ``per_token_cast_to_fp8_packed_ue8m0`` but writes
 directly into the final buffer instead of materializing temporary tensors.
 """
 
