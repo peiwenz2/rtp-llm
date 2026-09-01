@@ -13,6 +13,16 @@ cc_test(
     ] + torch_deps(),
 )
 
+cc_test(
+    name = "prefill_cuda_graph_replay_metadata_test",
+    srcs = ["prefill_cuda_graph_replay_metadata_test.cc"],
+    copts = copts(),
+    deps = [
+        "//rtp_llm/cpp/cuda_graph:prefill_cuda_graph_replay_metadata",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
 cc_library(
     name = "test_cuda_graph_runner_libs",
     srcs = [

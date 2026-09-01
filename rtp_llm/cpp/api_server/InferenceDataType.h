@@ -101,6 +101,7 @@ public:
         json.Jsonize("speculative_accepted_tokens_per_pos",
                      speculative_accepted_tokens_per_pos,
                      speculative_accepted_tokens_per_pos);
+        json.Jsonize("prefill_cuda_graph_status", prefill_cuda_graph_status, prefill_cuda_graph_status);
     }
     AuxInfoAdapter() {
         AuxInfo();
@@ -119,6 +120,7 @@ public:
         remote_reuse_len                    = base.remote_reuse_len;
         speculative_draft_rounds            = base.speculative_draft_rounds;
         speculative_accepted_tokens_per_pos = base.speculative_accepted_tokens_per_pos;
+        prefill_cuda_graph_status           = base.prefill_cuda_graph_status;
 
         cost_time_ms = cost_time_us / 1000.0;
     }

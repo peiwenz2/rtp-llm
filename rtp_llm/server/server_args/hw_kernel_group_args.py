@@ -4,6 +4,20 @@ from typing import List
 from rtp_llm.server.server_args.util import str2bool
 
 
+def _positive_int(value: str) -> int:
+    import argparse
+
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as e:
+        raise argparse.ArgumentTypeError(
+            f"expected a positive integer, got {value}"
+        ) from e
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError(f"expected a positive integer, got {value}")
+    return parsed
+
+
 def init_hw_kernel_group_args(parser, hw_kernel_config):
     ##############################################################################################################
     # 硬件/Kernel 特定优化
@@ -26,6 +40,40 @@ def init_hw_kernel_group_args(parser, hw_kernel_config):
         type=str2bool,
         default=False,
         help="系统是否允许使用Cuda Graph开启Debug模式来生成可视化文件",
+    )
+
+    hw_kernel_group.add_argument(
+        "--enable_prefill_cuda_graph",
+        env_name="ENABLE_PREFILL_CUDA_GRAPH",
+        bind_to=(hw_kernel_config, "enable_prefill_cuda_graph"),
+        type=str2bool,
+        default=False,
+        help=(
+            "为 graph-safe 的 attention backend 开启 Prefill CUDA Graph。"
+            "需要同时设置 ENABLE_CUDA_GRAPH=1；首版仅支持单卡执行。"
+        ),
+    )
+
+    hw_kernel_group.add_argument(
+        "--prefill_cuda_graph_max_requests",
+        env_name="PREFILL_CUDA_GRAPH_MAX_REQUESTS",
+        bind_to=(hw_kernel_config, "prefill_cuda_graph_max_requests"),
+        type=_positive_int,
+        default=8,
+        help="Prefill CUDA Graph 中真实 context sequence row 的最大数量",
+    )
+
+    hw_kernel_group.add_argument(
+        "--prefill_cuda_graph_capture_config",
+        env_name="PREFILL_CUDA_GRAPH_CAPTURE_CONFIG",
+        type=_parse_prefill_cuda_graph_capture_config,
+        default=None,
+        bind_to=(hw_kernel_config, "prefill_cuda_graph_capture_seq_lens"),
+        help=(
+            "Prefill CUDA Graph capture token buckets. Uses the same file/list/range "
+            "syntax as PREFILL_CAPTURE_CONFIG and is limited to 64 buckets. "
+            "未显式配置时按模型 max_seq_len 自动裁剪内置稀疏 bucket。"
+        ),
     )
 
     hw_kernel_group.add_argument(
@@ -212,7 +260,11 @@ def _parse_comma_separated_ints(
                 return []
 
 
-def _parse_prefill_capture_config(config: str) -> List[int]:
+def _parse_prefill_capture_config(
+    config: str,
+    config_name: str = "prefill_capture_config",
+    max_buckets: int | None = None,
+) -> List[int]:
     """
     Parse prefill capture sequence lengths configuration string.
     Supports three formats:
@@ -234,9 +286,16 @@ def _parse_prefill_capture_config(config: str) -> List[int]:
     """
     import argparse
 
+    def validate_bucket_count(seq_lens: List[int]) -> List[int]:
+        if max_buckets is not None and len(seq_lens) > max_buckets:
+            raise argparse.ArgumentTypeError(
+                f"{config_name} produced {len(seq_lens)} buckets; maximum is {max_buckets}"
+            )
+        return seq_lens
+
     if not config:
         raise argparse.ArgumentTypeError(
-            "prefill_capture_config must be set. Supported formats:\n"
+            f"{config_name} must be set. Supported formats:\n"
             "  1. File path: 'file:///path/to/seq_lens.txt' or '/path/to/seq_lens.txt'\n"
             "  2. Comma-separated list: '10,100,500,1000,2000'\n"
             "  3. Range: '16384:128' (generates [128, 256, ..., 16384])"
@@ -263,17 +322,25 @@ def _parse_prefill_capture_config(config: str) -> List[int]:
                 logging.info(
                     f"Loaded {len(seq_lens)} sequence lengths from {file_path}"
                 )
-                return seq_lens
+                return validate_bucket_count(seq_lens)
             else:
                 raise argparse.ArgumentTypeError(
                     f"No valid sequence lengths found in file: {file_path}"
                 )
-        except FileNotFoundError:
+        except FileNotFoundError as e:
+            if config_name == "prefill_capture_config":
+                raise argparse.ArgumentTypeError(
+                    f"Prefill capture file not found: {file_path}"
+                ) from e
             raise argparse.ArgumentTypeError(
-                f"Prefill capture file not found: {file_path}"
-            )
+                f"{config_name} file not found: {file_path}"
+            ) from e
         except Exception as e:
-            raise argparse.ArgumentTypeError(f"Error reading prefill capture file: {e}")
+            if isinstance(e, argparse.ArgumentTypeError):
+                raise
+            raise argparse.ArgumentTypeError(
+                f"Error reading {config_name} file: {e}"
+            ) from e
 
     # Mode 3: Range format (max:step)
     if ":" in config:
@@ -285,6 +352,11 @@ def _parse_prefill_capture_config(config: str) -> List[int]:
             step = int(parts[1].strip())
             if max_seq_len <= 0 or step <= 0:
                 raise ValueError("max_seq_len and step must be positive integers")
+            bucket_count = (max_seq_len + step - 1) // step
+            if max_buckets is not None and bucket_count > max_buckets:
+                raise argparse.ArgumentTypeError(
+                    f"{config_name} produced {bucket_count} buckets; maximum is {max_buckets}"
+                )
             seq_lens = list(range(step, max_seq_len + 1, step))
             if max_seq_len not in seq_lens:
                 seq_lens.append(max_seq_len)
@@ -292,25 +364,37 @@ def _parse_prefill_capture_config(config: str) -> List[int]:
                 logging.info(
                     f"Generated {len(seq_lens)} sequence lengths from range (step={step}, max={max_seq_len})"
                 )
-                return seq_lens
+                return validate_bucket_count(seq_lens)
             else:
                 raise ValueError(
                     f"Invalid range parameters: max_seq_len={max_seq_len}, step={step}"
                 )
         except ValueError as e:
-            raise argparse.ArgumentTypeError(f"Invalid range format '{config}': {e}")
+            raise argparse.ArgumentTypeError(
+                f"Invalid range format '{config}': {e}"
+            ) from e
 
     # Mode 2: Comma-separated list (default)
     try:
-        return _parse_comma_separated_ints(
-            config,
-            "prefill_capture_config",
-            "prefill capture sequence lengths",
-            raise_on_empty=True,
+        return validate_bucket_count(
+            _parse_comma_separated_ints(
+                config,
+                config_name,
+                f"{config_name} sequence lengths",
+                raise_on_empty=True,
+            )
         )
     except ValueError as e:
         # Convert ValueError to ArgumentTypeError for argparse
         raise argparse.ArgumentTypeError(str(e))
+
+
+def _parse_prefill_cuda_graph_capture_config(config: str) -> List[int]:
+    return _parse_prefill_capture_config(
+        config,
+        config_name="prefill_cuda_graph_capture_config",
+        max_buckets=64,
+    )
 
 
 def _parse_decode_capture_config(config: str) -> List[int]:

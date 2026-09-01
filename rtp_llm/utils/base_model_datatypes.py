@@ -8,7 +8,6 @@ from rtp_llm.config.generate_config import GenerateConfig, RoleAddr
 from rtp_llm.ops import MultimodalInput
 
 
-
 class EmbeddingOutput:
     text_embedding: torch.Tensor
     extra_input: Optional[torch.Tensor]
@@ -123,6 +122,7 @@ class AuxInfo:
     multimodal_lengths: Dict[int, int] = field(default_factory=dict)
     speculative_draft_rounds: int = 0
     speculative_accepted_tokens_per_pos: List[int] = field(default_factory=list)
+    prefill_cuda_graph_status: str = "not_requested"
 
     role_addrs: List[RoleAddr] = field(default_factory=list)
     aux_string: str = ""

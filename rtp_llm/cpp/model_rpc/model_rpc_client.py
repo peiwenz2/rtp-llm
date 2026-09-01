@@ -784,6 +784,9 @@ def trans_output(
                 speculative_accepted_tokens_per_pos=list(
                     aux_info_pb.speculative_accepted_tokens_per_pos
                 ),
+                prefill_cuda_graph_status=(
+                    aux_info_pb.prefill_cuda_graph_status or "not_requested"
+                ),
                 aux_string=aux_info_pb.aux_string,
                 role_addrs=input_py.generate_config.role_addrs,
             )

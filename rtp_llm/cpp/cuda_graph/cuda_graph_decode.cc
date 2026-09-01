@@ -64,9 +64,10 @@ void CudaGraphRunner::captureDecode() {
 
         graph_instances_[bs].mem_hold_ = createCaptureMemoryHold(inputs, bs * num_tokens_per_bs_);
         graph_instances_[bs].mem_hold_.attn_pyobj_ =
-            py_attn_pyobj_method_(graph_instances_[bs].mem_hold_.py_model_inputs_, true);
+            prepareFmhaImpl(graph_instances_[bs].mem_hold_.py_model_inputs_, true);
         captureDecodeOneBatchSize(bs);
         cuda_graph::finish_capture_session();
+        capture_session_may_be_dirty_.store(false, std::memory_order_release);
         replayAndSyncCheck(bs, "batch size");
         RTP_LLM_LOG_INFO("capture success for batch size: %d", bs);
     }

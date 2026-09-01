@@ -74,6 +74,10 @@ struct MallocInfo {
     // Override for incrMalloc's seqLength read; -1 = fall back to complete_token_ids->seqLength().
     // Lets the state machine feed the publish-time value instead of racing with the async worker.
     int incr_seq_len_override = -1;
+    // Internal reservations (for example CUDA Graph scratch blocks) must not
+    // appear as user-request prefill cache hits. Keep this at the end so legacy
+    // positional aggregate initializers retain their field mapping.
+    bool report_prefill_cache_hit_metrics = true;
 
     int incrSeqLen() const;
 };

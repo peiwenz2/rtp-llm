@@ -40,6 +40,46 @@ public:
         runner_ = CudaGraphRunner::createForPrefill(std::move(py_instance), std::move(params));
     }
 
+    void init_generative_prefill(py::object               py_instance,
+                                 int64_t                  max_requests,
+                                 int64_t                  max_seq_len,
+                                 int64_t                  tokens_per_block,
+                                 int64_t                  kernel_tokens_per_block,
+                                 std::vector<int>         prefill_capture_seq_lens,
+                                 int64_t                  hidden_size,
+                                 std::vector<std::string> group_tags,
+                                 int64_t                  position_id_len_factor) {
+        reset_runner();
+        GraphParams params;
+        params.enable_cuda_graph_debug_mode    = true;
+        params.role                            = CudaGraphRole::GENERATIVE_PREFILL;
+        params.max_seq_len                     = static_cast<int>(max_seq_len);
+        params.tokens_per_block                = static_cast<int>(tokens_per_block);
+        params.kernel_tokens_per_block         = static_cast<int>(kernel_tokens_per_block);
+        params.num_tokens_per_bs               = 1;
+        params.max_context_batch_size          = static_cast<size_t>(max_requests + 1);
+        params.hidden_size                     = static_cast<size_t>(hidden_size);
+        params.input_hidden_size               = static_cast<size_t>(hidden_size);
+        params.model_data_type                 = c10::ScalarType::BFloat16;
+        params.prefill_capture_seq_lens        = std::move(prefill_capture_seq_lens);
+        params.kv_cache_group_tags             = std::move(group_tags);
+        params.prefill_cuda_graph_max_requests = static_cast<int>(max_requests);
+        params.prefill_cuda_graph_pad_token_id = 0;
+        params.position_id_len_factor          = static_cast<int>(position_id_len_factor);
+        const size_t scratch_group_count =
+            params.kv_cache_group_tags.size() > 1 ? params.kv_cache_group_tags.size() : 1;
+        const int scratch_block_count = (static_cast<int>(max_seq_len) + static_cast<int>(kernel_tokens_per_block) - 1)
+                                        / static_cast<int>(kernel_tokens_per_block);
+        params.prefill_scratch_kernel_block_ids.resize(scratch_group_count);
+        for (auto& block_ids : params.prefill_scratch_kernel_block_ids) {
+            block_ids.resize(scratch_block_count);
+            for (int i = 0; i < scratch_block_count; ++i) {
+                block_ids[i] = i;
+            }
+        }
+        runner_ = CudaGraphRunner::createForPrefill(std::move(py_instance), std::move(params));
+    }
+
     void init_decode(py::object               py_instance,
                      int64_t                  hidden_size,
                      int64_t                  max_seq_len,
@@ -83,7 +123,11 @@ public:
     }
 
     int getCurrentRealGraphSize() {
-        return runner_ != nullptr ? runner_->getCurrentRealGraphBs(state_) : 0;
+        return runner_ != nullptr ? runner_->getCurrentRealGraphSize(state_) : 0;
+    }
+
+    std::string getPrefillStatus() const {
+        return prefillCudaGraphStatusString(state_.prefill_status);
     }
 
     ~CudaGraphTestRunner() {
@@ -129,7 +173,19 @@ PYBIND11_MODULE(libtest_cuda_graph_runner, m) {
              py::arg("group_tags")        = std::vector<std::string>{},
              py::arg("is_target_verify")  = false,
              py::arg("num_tokens_per_bs") = 1)
+        .def("init_generative_prefill",
+             &CudaGraphTestRunner::init_generative_prefill,
+             py::arg("py_instance"),
+             py::arg("max_requests"),
+             py::arg("max_seq_len"),
+             py::arg("tokens_per_block"),
+             py::arg("kernel_tokens_per_block"),
+             py::arg("prefill_capture_seq_lens"),
+             py::arg("hidden_size"),
+             py::arg("group_tags")             = std::vector<std::string>{},
+             py::arg("position_id_len_factor") = 0)
         .def("canRun", &CudaGraphTestRunner::canRun)
         .def("forward", &CudaGraphTestRunner::forward)
+        .def("getPrefillStatus", &CudaGraphTestRunner::getPrefillStatus)
         .def("getCurrentRealGraphSize", &CudaGraphTestRunner::getCurrentRealGraphSize);
 }

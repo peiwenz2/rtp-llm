@@ -288,6 +288,7 @@ const CacheConfig& KVCacheManager::getMTPModuleCacheConfig(int mtp_module_id) co
 
 MallocResult KVCacheManager::malloc(const MallocInfo& malloc_info) {
     RTP_LLM_PROFILE_FUNCTION();
+    RTP_LLM_CHECK_WITH_INFO(allocator_ != nullptr, "KVCacheManager::malloc called before KVCacheManager::init");
     RTP_LLM_CHECK(malloc_info.batch_kv_cache_resource && malloc_info.complete_token_ids);
 
     const int  seq_size_per_block = config_.seq_size_per_block;
@@ -310,7 +311,9 @@ MallocResult KVCacheManager::malloc(const MallocInfo& malloc_info) {
     } else {
         updateCacheKeys(malloc_info.batch_kv_cache_resource, malloc_info.complete_token_ids, seq_size_per_block);
     }
-    reportPrefillCacheHitMetrics(malloc_info, keys_initialized_now);
+    if (malloc_info.report_prefill_cache_hit_metrics) {
+        reportPrefillCacheHitMetrics(malloc_info, keys_initialized_now);
+    }
 
     // MallocResult carries MallocStatus out by value. Do not flatten it to a bare bool on the way
     // up: StreamCacheResource distinguishes RETRYABLE_RESOURCE_EXHAUSTED (keep the stream WAITING)
