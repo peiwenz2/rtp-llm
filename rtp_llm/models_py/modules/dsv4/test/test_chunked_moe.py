@@ -141,6 +141,7 @@ def _fake_moe(dim: int, cap: int, is_decode_role: bool = False) -> MoE:
     moe.max_tokens_per_rank = cap
     moe._is_decode_role = is_decode_role
     moe._routed_includes_shared = False
+    moe._skip_shared_expert = False
     moe.gate = _FakeGate()
     moe.shared_experts = nn.Identity()
     moe._shared_executor = _FakeSharedExecutor()

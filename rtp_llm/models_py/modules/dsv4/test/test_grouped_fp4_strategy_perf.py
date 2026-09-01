@@ -102,14 +102,21 @@ def _bench(fn, warmup: int = 5, iters: int = 12, repeats: int = 3) -> float:
     return sorted(samples)[len(samples) // 2]
 
 
-@unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
 class GroupedFP4StrategyPerfTest(unittest.TestCase):
-    def test_cuda_graph_capture_bs1_matches_eager(self):
+    @classmethod
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        if not torch.cuda.is_available():
+            raise AssertionError("CUDA is required by this dedicated SM100 target")
         if torch.cuda.get_device_capability()[0] != 10:
-            self.skipTest("SM100 required")
+            raise AssertionError("SM100 is required by this dedicated SM100 target")
         if not _has_fp8_fp4_grouped_kernel():
-            self.skipTest("grouped FP8xFP4 DeepGEMM kernel unavailable")
+            raise AssertionError(
+                "grouped FP8xFP4 DeepGEMM kernel is required by this dedicated "
+                "SM100 target"
+            )
 
+    def test_cuda_graph_capture_bs1_matches_eager(self):
         torch.manual_seed(20260515)
         E, D, inter, topk, tokens = 8, 512, 256, 6, 1
         cfg = _cfg(E, D, inter, topk, tokens)
@@ -142,11 +149,6 @@ class GroupedFP4StrategyPerfTest(unittest.TestCase):
         )
 
     def test_grouped_fp4_beats_local_loop(self):
-        if torch.cuda.get_device_capability()[0] != 10:
-            self.skipTest("SM100 required")
-        if not _has_fp8_fp4_grouped_kernel():
-            self.skipTest("grouped FP8xFP4 DeepGEMM kernel unavailable")
-
         torch.manual_seed(20260514)
         E, D, inter, topk, tokens = 32, 512, 256, 6, 1024
         cfg = _cfg(E, D, inter, topk, tokens)

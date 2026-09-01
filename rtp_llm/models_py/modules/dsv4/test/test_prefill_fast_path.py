@@ -115,6 +115,7 @@ class PrefillFastPathTest(unittest.TestCase):
         )
 
         self.assertIs(resolved, existing)
+        self.assertEqual(resolved.dtype, existing.dtype)
 
     def test_prefill_cu_seqlens_rebuilt_for_startup_warmup(self):
         resolved = prefill_forward._resolve_prefill_cu_seqlens(
@@ -127,13 +128,37 @@ class PrefillFastPathTest(unittest.TestCase):
         self.assertTrue(resolved.is_contiguous())
         torch.testing.assert_close(resolved, torch.tensor([0, 2, 5], dtype=torch.int32))
 
+    def test_prefill_cu_seqlens_rebuilt_when_metadata_is_missing(self):
+        resolved = prefill_forward._resolve_prefill_cu_seqlens(
+            None,
+            torch.tensor([2, 3], dtype=torch.int32),
+        )
+
+        self.assertEqual(resolved.dtype, torch.int32)
+        self.assertTrue(resolved.is_contiguous())
+        torch.testing.assert_close(resolved, torch.tensor([0, 2, 5], dtype=torch.int32))
+
+    def test_prefill_cu_seqlens_single_sentinel_is_rebuilt_as_int32(self):
+        resolved = prefill_forward._resolve_prefill_cu_seqlens(
+            torch.tensor([0], dtype=torch.int64),
+            torch.tensor([2, 3], dtype=torch.int64),
+            torch.device("cpu"),
+        )
+
+        self.assertEqual(resolved.dtype, torch.int32)
+        self.assertTrue(resolved.is_contiguous())
+        torch.testing.assert_close(resolved, torch.tensor([0, 2, 5], dtype=torch.int32))
+
     def test_prefill_cu_seqlens_requires_request_lengths(self):
-        with self.assertRaisesRegex(RuntimeError, "non-empty input_lengths"):
-            prefill_forward._resolve_prefill_cu_seqlens(
-                None,
-                torch.empty(0, dtype=torch.int32),
-                torch.device("cpu"),
-            )
+        for input_lengths in (None, torch.empty(0, dtype=torch.int32)):
+            with self.subTest(input_lengths=input_lengths), self.assertRaisesRegex(
+                RuntimeError, "non-empty input_lengths"
+            ):
+                prefill_forward._resolve_prefill_cu_seqlens(
+                    None,
+                    input_lengths,
+                    torch.device("cpu"),
+                )
 
     def test_disable_record_function_ranges_is_scoped(self):
         calls = []

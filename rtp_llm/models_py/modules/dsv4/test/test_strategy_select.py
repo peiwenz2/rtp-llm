@@ -16,8 +16,9 @@ from rtp_llm.models_py.modules.dsv4.moe.strategies import (
     MegaMoEStrategy,
     MoeCfg,
     _has_fp8_fp4_grouped_kernel,
-    select_strategy,
 )
+from rtp_llm.models_py.modules.dsv4.moe.strategies import base as strategy_base
+from rtp_llm.models_py.modules.dsv4.moe.strategies import select_strategy
 from rtp_llm.models_py.modules.dsv4.moe.strategies.base import _resolve_forced
 
 
@@ -41,6 +42,15 @@ def _cfg(ep_size: int = 1, n_shared_experts: int = 1) -> MoeCfg:
 
 
 class StrategySelectTest(unittest.TestCase):
+    def setUp(self):
+        self._env = mock.patch.dict(os.environ, {}, clear=True)
+        self._env.start()
+        strategy_base._DEPRECATION_WARNED.clear()
+        strategy_base._MEGA_SE_FALLBACK_WARNED = False
+
+    def tearDown(self):
+        self._env.stop()
+
     def test_ep1_with_grouped_kernel_picks_grouped(self):
         with mock.patch.object(
             GroupedFP4Strategy, "can_handle", return_value=True
@@ -126,45 +136,40 @@ class StrategySelectTest(unittest.TestCase):
             )
 
     def test_explicit_mega_moe_se_without_shared_expert_fails(self):
-        with mock.patch.object(MegaMoESEStrategy, "can_handle", return_value=False):
+        # The topology invariant is checked independently of runtime probing.
+        with mock.patch.object(MegaMoESEStrategy, "can_handle", return_value=True):
             with self.assertRaises(RuntimeError) as cm:
                 select_strategy(
                     _cfg(ep_size=4, n_shared_experts=0), forced="mega_moe_se"
                 )
-        self.assertIn("Forced MoE strategy 'mega_moe_se'", str(cm.exception))
+        self.assertIn("requires exactly one shared expert", str(cm.exception))
 
-    def test_removed_selection_envs_do_not_override_explicit_or_auto(self):
-        legacy_env = {
-            "DSV4_MOE_STRATEGY": "mega_moe_se",
-            "DSV4_USE_MEGA_MOE": "0",
-            "DSV4_USE_MEGA_MOE_SE": "0",
-            "DSV4_USE_GROUPED_FP4": "1",
-        }
-        with mock.patch.dict(os.environ, legacy_env, clear=False), mock.patch.object(
-            MegaMoEStrategy, "can_handle", return_value=True
-        ), mock.patch.object(MegaMoESEStrategy, "can_handle", return_value=True):
-            self.assertIs(
-                select_strategy(_cfg(ep_size=4, n_shared_experts=1), forced="mega_moe"),
-                MegaMoEStrategy,
-            )
+    def test_auto_falls_back_to_mega_moe_when_se_is_unavailable(self):
+        with mock.patch.object(
+            MegaMoESEStrategy, "can_handle", return_value=False
+        ), mock.patch.object(MegaMoEStrategy, "can_handle", return_value=True):
             self.assertIs(
                 select_strategy(_cfg(ep_size=4, n_shared_experts=1)),
-                MegaMoESEStrategy,
+                MegaMoEStrategy,
             )
 
-    def test_model_selected_mega_moe_se_unavailable_fails_without_fallback(self):
+    def test_explicit_mega_moe_se_stays_strict_when_unavailable(self):
         with mock.patch.object(MegaMoESEStrategy, "can_handle", return_value=False):
+            with self.assertRaisesRegex(
+                RuntimeError, "Forced MoE strategy 'mega_moe_se'"
+            ):
+                select_strategy(
+                    _cfg(ep_size=4, n_shared_experts=1), forced="mega_moe_se"
+                )
+
+    def test_auto_fails_after_both_mega_variants_are_unavailable(self):
+        with mock.patch.object(
+            MegaMoESEStrategy, "can_handle", return_value=False
+        ), mock.patch.object(MegaMoEStrategy, "can_handle", return_value=False):
             with self.assertRaises(RuntimeError) as cm:
                 select_strategy(_cfg(ep_size=4, n_shared_experts=1))
-        self.assertIn("selected 'mega_moe_se' from model metadata", str(cm.exception))
-        self.assertIn("fallback is disabled", str(cm.exception))
-
-    def test_model_selected_mega_moe_unavailable_fails_without_fallback(self):
-        with mock.patch.object(MegaMoEStrategy, "can_handle", return_value=False):
-            with self.assertRaises(RuntimeError) as cm:
-                select_strategy(_cfg(ep_size=4, n_shared_experts=0))
-        self.assertIn("selected 'mega_moe' from model metadata", str(cm.exception))
-        self.assertIn("fallback is disabled", str(cm.exception))
+        self.assertIn("mega_moe_se", str(cm.exception))
+        self.assertIn("mega_moe", str(cm.exception))
 
     def test_forced_known_and_capable_returns_it(self):
         self.assertIs(
@@ -197,6 +202,193 @@ class StrategySelectTest(unittest.TestCase):
     def test_resolve_named_value_is_strict(self):
         self.assertEqual(_resolve_forced("mega_moe"), ("mega_moe", True))
         self.assertEqual(_resolve_forced("mega_moe_se"), ("mega_moe_se", True))
+
+    def test_legacy_strategy_names_map_to_public_names(self):
+        for old, new in (
+            ("mega", "mega_moe"),
+            ("mega_se", "mega_moe_se"),
+        ):
+            with self.subTest(old=old), mock.patch.dict(
+                os.environ, {"DSV4_MOE_STRATEGY": old}, clear=True
+            ):
+                strategy_base._DEPRECATION_WARNED.clear()
+                with mock.patch.object(strategy_base.logging, "warning") as warning:
+                    self.assertEqual(_resolve_forced(None), (new, True))
+                warning.assert_called()
+
+    def test_removed_legacy_fused_name_has_actionable_migration_error(self):
+        with mock.patch.dict(
+            os.environ, {"DSV4_MOE_STRATEGY": "mega_fused"}, clear=True
+        ):
+            with self.assertRaisesRegex(RuntimeError, "MOE_STRATEGY=mega_moe_se"):
+                _resolve_forced(None)
+
+    def test_removed_constructor_fused_name_has_actionable_migration_error(self):
+        with self.assertRaisesRegex(RuntimeError, "MOE_STRATEGY=mega_moe_se"):
+            _resolve_forced("mega_fused")
+
+    def test_legacy_boolean_toggles_keep_compatibility(self):
+        cases = (
+            ({"DSV4_USE_MEGA_MOE": "1"}, ("mega_moe", False)),
+            ({"DSV4_USE_MEGA_MOE_SE": "1"}, ("mega_moe_se", True)),
+            ({"DSV4_USE_GROUPED_FP4": "1"}, ("grouped_fp4", False)),
+        )
+        for env, expected in cases:
+            with self.subTest(env=env), mock.patch.dict(os.environ, env, clear=True):
+                strategy_base._DEPRECATION_WARNED.clear()
+                with mock.patch.object(strategy_base.logging, "warning") as warning:
+                    self.assertEqual(_resolve_forced(None), expected)
+                warning.assert_called()
+
+    def test_legacy_negative_toggles_preserve_rollback_semantics(self):
+        cases = (
+            ("DSV4_USE_GROUPED_FP4", 1, ("local_loop", True)),
+            ("DSV4_USE_MEGA_MOE_SE", 4, ("mega_moe", True)),
+            ("DSV4_USE_MEGA_MOE_FUSED", 4, ("mega_moe", True)),
+        )
+        for name, ep_size, expected in cases:
+            with self.subTest(name=name), mock.patch.dict(
+                os.environ, {name: "0"}, clear=True
+            ):
+                strategy_base._DEPRECATION_WARNED.clear()
+                with mock.patch.object(strategy_base.logging, "warning") as warning:
+                    self.assertEqual(_resolve_forced(None, ep_size=ep_size), expected)
+                warning.assert_called()
+
+    def test_constructor_alias_warning_names_the_actual_source(self):
+        with mock.patch.object(strategy_base.logging, "warning") as warning:
+            self.assertEqual(_resolve_forced("mega"), ("mega_moe", True))
+        self.assertIn("MoE strategy argument", warning.call_args.args[2])
+
+    def test_legacy_and_public_conflict_fails(self):
+        with mock.patch.dict(os.environ, {"DSV4_USE_GROUPED_FP4": "1"}, clear=True):
+            with self.assertRaisesRegex(RuntimeError, "Conflicting MoE"):
+                _resolve_forced("local_loop")
+
+    def test_conflicting_legacy_toggles_fail(self):
+        with mock.patch.dict(
+            os.environ,
+            {"DSV4_USE_MEGA_MOE_SE": "1", "DSV4_USE_GROUPED_FP4": "1"},
+            clear=True,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "Conflicting legacy"):
+                _resolve_forced(None)
+
+    def test_invalid_legacy_toggle_fails(self):
+        with mock.patch.dict(
+            os.environ, {"DSV4_USE_MEGA_MOE": "sometimes"}, clear=True
+        ):
+            with self.assertRaisesRegex(RuntimeError, "Invalid legacy MoE toggle"):
+                _resolve_forced(None)
+
+    def test_legacy_grouped_auto_preserves_auto_selection(self):
+        with mock.patch.dict(
+            os.environ, {"DSV4_USE_GROUPED_FP4": "auto"}, clear=True
+        ), mock.patch.object(GroupedFP4Strategy, "can_handle", return_value=True):
+            forced, strict = _resolve_forced(None, ep_size=1)
+            self.assertEqual((forced, strict), (None, False))
+            self.assertIs(
+                select_strategy(_cfg(ep_size=1), forced=forced, strict=strict),
+                GroupedFP4Strategy,
+            )
+
+    def test_legacy_mega_toggles_are_noops_on_single_card(self):
+        for name, value in (
+            ("DSV4_USE_MEGA_MOE_SE", "0"),
+            ("DSV4_USE_MEGA_MOE_FUSED", "0"),
+        ):
+            with self.subTest(name=name), mock.patch.dict(
+                os.environ, {name: value}, clear=True
+            ), mock.patch.object(GroupedFP4Strategy, "can_handle", return_value=True):
+                forced, strict = _resolve_forced(None, ep_size=1)
+                self.assertEqual((forced, strict), (None, False))
+                self.assertIs(
+                    select_strategy(_cfg(ep_size=1), forced=forced, strict=strict),
+                    GroupedFP4Strategy,
+                )
+
+    def test_legacy_grouped_disable_is_noop_on_ep_topology(self):
+        with mock.patch.dict(
+            os.environ, {"DSV4_USE_GROUPED_FP4": "0"}, clear=True
+        ), mock.patch.object(MegaMoESEStrategy, "can_handle", return_value=True):
+            forced, strict = _resolve_forced(None, ep_size=4)
+            self.assertEqual((forced, strict), (None, False))
+            self.assertIs(
+                select_strategy(
+                    _cfg(ep_size=4, n_shared_experts=1),
+                    forced=forced,
+                    strict=strict,
+                ),
+                MegaMoESEStrategy,
+            )
+
+    def test_legacy_se_enable_stays_strict_on_single_card(self):
+        with mock.patch.dict(
+            os.environ, {"DSV4_USE_MEGA_MOE_SE": "1"}, clear=True
+        ), mock.patch.object(MegaMoESEStrategy, "can_handle", return_value=False):
+            forced, strict = _resolve_forced(None, ep_size=1)
+            self.assertEqual((forced, strict), ("mega_moe_se", True))
+            with self.assertRaisesRegex(RuntimeError, "cannot handle cfg"):
+                select_strategy(_cfg(ep_size=1), forced=forced, strict=strict)
+
+    def test_removed_legacy_fused_toggle_has_actionable_migration_error(self):
+        for ep_size in (1, 4):
+            with self.subTest(ep_size=ep_size), mock.patch.dict(
+                os.environ, {"DSV4_USE_MEGA_MOE_FUSED": "1"}, clear=True
+            ):
+                with self.assertRaisesRegex(RuntimeError, "MOE_STRATEGY=mega_moe_se"):
+                    _resolve_forced(None, ep_size=ep_size)
+
+    def test_legacy_fused_disable_preserves_non_fused_rollback(self):
+        with mock.patch.dict(
+            os.environ, {"DSV4_USE_MEGA_MOE_FUSED": "0"}, clear=True
+        ), mock.patch.object(MegaMoEStrategy, "can_handle", return_value=True):
+            forced, strict = _resolve_forced(None, ep_size=4)
+            self.assertEqual((forced, strict), ("mega_moe", True))
+            self.assertIs(
+                select_strategy(
+                    _cfg(ep_size=4, n_shared_experts=1),
+                    forced=forced,
+                    strict=strict,
+                ),
+                MegaMoEStrategy,
+            )
+
+    def test_legacy_grouped_disable_forces_local_loop(self):
+        with mock.patch.dict(
+            os.environ, {"DSV4_USE_GROUPED_FP4": "0"}, clear=True
+        ), mock.patch.object(GroupedFP4Strategy, "can_handle", return_value=True):
+            forced, strict = _resolve_forced(None, ep_size=1)
+            self.assertEqual((forced, strict), ("local_loop", True))
+            self.assertIs(
+                select_strategy(_cfg(ep_size=1), forced=forced, strict=strict),
+                LocalLoopStrategy,
+            )
+
+    def test_legacy_mega_disable_fails_fast_on_ep_topology(self):
+        with mock.patch.dict(os.environ, {"DSV4_USE_MEGA_MOE": "0"}, clear=True):
+            with self.assertRaisesRegex(RuntimeError, "disables Mega MoE"):
+                _resolve_forced(None, ep_size=4)
+
+    def test_legacy_se_disable_excludes_fused_se(self):
+        with mock.patch.dict(
+            os.environ, {"DSV4_USE_MEGA_MOE_SE": "0"}, clear=True
+        ), mock.patch.object(MegaMoEStrategy, "can_handle", return_value=True):
+            forced, strict = _resolve_forced(None, ep_size=4)
+            self.assertEqual((forced, strict), ("mega_moe", True))
+            self.assertIs(
+                select_strategy(
+                    _cfg(ep_size=4, n_shared_experts=1),
+                    forced=forced,
+                    strict=strict,
+                ),
+                MegaMoEStrategy,
+            )
+
+    def test_public_strategy_cannot_override_legacy_negative_constraint(self):
+        with mock.patch.dict(os.environ, {"DSV4_USE_GROUPED_FP4": "0"}, clear=True):
+            with self.assertRaisesRegex(RuntimeError, "Conflicting MoE"):
+                _resolve_forced("grouped_fp4", ep_size=1)
 
 
 if __name__ == "__main__":

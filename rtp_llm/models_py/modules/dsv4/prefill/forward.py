@@ -243,8 +243,8 @@ def _build_positions_from_lengths(
 
 def _resolve_prefill_cu_seqlens(
     cu_seqlens: Optional[torch.Tensor],
-    input_lengths: torch.Tensor,
-    device: torch.device,
+    input_lengths: Optional[torch.Tensor],
+    device: Optional[torch.device] = None,
 ) -> torch.Tensor:
     """Return valid query boundaries for normal and warmup prefill calls.
 
@@ -257,14 +257,15 @@ def _resolve_prefill_cu_seqlens(
     if cu_seqlens is not None and cu_seqlens.numel() >= 2:
         return cu_seqlens
 
-    lengths = input_lengths.to(device=device, dtype=torch.int32).reshape(-1)
-    if lengths.numel() == 0:
+    if input_lengths is None or input_lengths.numel() == 0:
         raise RuntimeError(
             "DSV4 prefill requires cu_seqlens or non-empty input_lengths"
         )
+    target_device = input_lengths.device if device is None else device
+    lengths = input_lengths.to(device=target_device, dtype=torch.int32).reshape(-1)
     return torch.cat(
         (
-            torch.zeros(1, dtype=torch.int32, device=device),
+            torch.zeros(1, dtype=torch.int32, device=target_device),
             torch.cumsum(lengths, dim=0, dtype=torch.int32),
         ),
         dim=0,
@@ -747,7 +748,7 @@ def forward_prefill(
     cu_seqlens = _resolve_prefill_cu_seqlens(
         attn.cu_seqlens,
         attn.input_lengths,
-        input_ids.device,
+        getattr(getattr(attn, "cu_seqlens_device", None), "device", None),
     )
     positions = getattr(attn, "combo_position_ids", None)
     # warmup / cudagraph capture path doesn't populate combo_position_ids —

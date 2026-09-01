@@ -15,6 +15,18 @@ from .defs.strategy_base import MoeStrategy
 logger = logging.getLogger(__name__)
 
 
+def _requested_strategy_context(config: MoEConfigAdapter) -> str:
+    requested = getattr(config, "moe_strategy", "auto")
+    model_config = getattr(config, "model_config", None)
+    model_scope = getattr(model_config, "model_type", None)
+    if not model_scope:
+        model_scope = type(model_config).__name__
+    return (
+        f"Requested MOE_STRATEGY={requested!r} for model scope "
+        f"{model_scope!r} in the generic fused-MoE factory."
+    )
+
+
 class StrategyRegistry:
     """Strategy registry
 
@@ -89,11 +101,12 @@ class StrategyRegistry:
                     "W8A8_INT8_PER_CHANNEL_COMPRESSED weights were loaded, but "
                     "no registered MOE compute backend can consume them; install "
                     "or register a backend with W8A8 INT8 per-channel execution "
-                    "support"
+                    f"support. {_requested_strategy_context(config)}"
                 )
             raise ValueError(
-                f"No suitable MOE strategy found for configuration. "
-                f"Please check quant_config, ep_size, and parallelism settings."
+                "No suitable MOE strategy found for configuration. "
+                "Please check quant_config, ep_size, and parallelism settings. "
+                f"{_requested_strategy_context(config)}"
             )
 
         # get_attributes() is not a plain accessor -- it does lazy imports and

@@ -225,8 +225,51 @@ class Dsv4SharedRuntimeBufferStore:
             module._bind_runtime_buffers(mtp_hidden_buffer)
 
 
+_DSV4_PUBLIC_MOE_STRATEGIES = frozenset(
+    {
+        "auto",
+        "mega_moe",
+        "mega_moe_se",
+        "grouped_fp4",
+        "local_loop",
+    }
+)
+_DSV4_MOE_STRATEGIES = _DSV4_PUBLIC_MOE_STRATEGIES | {
+    # One-cycle aliases are normalized by the DSV4 strategy selector.
+    "mega",
+    "mega_se",
+    "mega_fused",
+}
+
+
+def _resolve_dsv4_moe_strategy(moe_config) -> str:
+    """Scope the shared public MoE option to DSV4's strategy registry.
+
+    ``MoeConfig.moe_strategy`` is also consumed by the generic fused-MoE
+    factory. Existing launch templates may therefore carry values such as
+    ``fp8_per_block_no_dp`` that DSV4 historically ignored. Preserve that
+    compatibility explicitly: warn and use DSV4 auto-selection instead of
+    forwarding a foreign name that later fails as an unknown DSV4 strategy.
+    """
+    if moe_config is None:
+        return "auto"
+    strategy = str(moe_config.moe_strategy or "auto").strip() or "auto"
+    if strategy in _DSV4_MOE_STRATEGIES:
+        return strategy
+    logging.warning(
+        "DeepSeek-V4 ignores generic MOE_STRATEGY=%r because it is not in the "
+        "DSV4 strategy namespace; falling back to DSV4 auto-selection. Use "
+        "one of %s for an explicit DSV4 selection.",
+        strategy,
+        sorted(_DSV4_PUBLIC_MOE_STRATEGIES),
+    )
+    return "auto"
+
+
 def _args_from_model_config(
-    model_config: ModelConfig, max_generate_batch_size: int = 4
+    model_config: ModelConfig,
+    max_generate_batch_size: int = 4,
+    moe_config=None,
 ) -> V4Args:
     from rtp_llm.ops import KvCacheDataType, RoleType
 
@@ -258,12 +301,10 @@ def _args_from_model_config(
         index_head_dim=attn_config.indexer_head_dim,
         index_topk=attn_config.indexer_topk,
         moe_inter_dim=int(model_config.moe_inter_size)
-        or (
-            int(model_config.inter_size)
-            // max(int(getattr(model_config, "n_shared_experts", 0)), 1)
-        ),
+        or (int(model_config.inter_size) // max(int(model_config.n_shared_experts), 1)),
         n_routed_experts=model_config.expert_num,
-        n_shared_experts=int(getattr(model_config, "n_shared_experts", 0)),
+        n_shared_experts=int(model_config.n_shared_experts),
+        moe_strategy=_resolve_dsv4_moe_strategy(moe_config),
         n_activated_experts=model_config.moe_k,
         score_func={0: "softmax", 1: "sigmoid", 2: "sqrtsoftplus"}[
             model_config.scoring_func
@@ -315,8 +356,11 @@ class DeepSeekV4Model(GptModelBase):
         )
 
         # Build V4Transformer with matching args.
-        args = _args_from_model_config(model_config, max_generate_batch_size)
-        args.moe_strategy = str(getattr(moe_config, "moe_strategy", "auto") or "auto")
+        args = _args_from_model_config(
+            model_config,
+            max_generate_batch_size,
+            moe_config=moe_config,
+        )
         self._max_generate_batch_size = int(max_generate_batch_size)
         assert self._max_generate_batch_size > 0, (
             "max_generate_batch_size must be positive, "

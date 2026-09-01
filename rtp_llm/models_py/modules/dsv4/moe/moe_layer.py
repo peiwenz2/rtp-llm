@@ -228,7 +228,7 @@ class MoE(nn.Module):
             local_expert_end=self.local_expert_end,
             max_tokens_per_rank=max_tokens_per_rank,
         )
-        forced, strict = _resolve_forced(strategy)
+        forced, strict = _resolve_forced(strategy, ep_size=ep_size)
         strategy_cls = select_strategy(cfg, forced=forced, strict=strict)
         # Strategies that fold the shared expert into their routed kernel
         # (currently MegaMoESEStrategy) own the shared-expert
@@ -281,19 +281,8 @@ class MoE(nn.Module):
         self._strategy.setup_weights(layer_weights)
 
     def _shared_execution_skipped(self) -> bool:
-        """Whether the strategy output needs no standalone shared-expert add.
-
-        The fallback keeps lightweight tests and diagnostics that construct a
-        ``MoE`` instance without calling ``__init__`` compatible with the
-        pre-existing ``_routed_includes_shared`` contract.
-        """
-        return bool(
-            getattr(
-                self,
-                "_skip_shared_expert",
-                getattr(self, "_routed_includes_shared", False),
-            )
-        )
+        """Whether the strategy output needs no standalone shared-expert add."""
+        return self._skip_shared_expert
 
     def _should_chunk(self, tokens: int) -> bool:
         max_tokens = int(self.max_tokens_per_rank)

@@ -21,8 +21,22 @@ class ServerArgsPyEnvConfigsTest(TestCase):
         with patch.dict(os.environ, {}, clear=True):
             nonse = server_args.setup_args(["--moe_strategy", "mega_moe"])
             fused_se = server_args.setup_args(["--moe_strategy", "mega_moe_se"])
+            grouped = server_args.setup_args(["--moe_strategy", "grouped_fp4"])
+            local = server_args.setup_args(["--moe_strategy", "local_loop"])
         self.assertEqual(nonse.moe_config.moe_strategy, "mega_moe")
         self.assertEqual(fused_se.moe_config.moe_strategy, "mega_moe_se")
+        self.assertEqual(grouped.moe_config.moe_strategy, "grouped_fp4")
+        self.assertEqual(local.moe_config.moe_strategy, "local_loop")
+
+    def test_dsv4_single_card_strategy_from_environment(self):
+        from rtp_llm.server.server_args import server_args
+
+        for strategy in ("grouped_fp4", "local_loop"):
+            with self.subTest(strategy=strategy), patch.dict(
+                os.environ, {"MOE_STRATEGY": strategy}, clear=True
+            ):
+                configs = server_args.setup_args([])
+                self.assertEqual(configs.moe_config.moe_strategy, strategy)
 
     def test_internal_backend_registers_moe_choice_before_parser_initialization(self):
         from rtp_llm.server.server_args import server_args
