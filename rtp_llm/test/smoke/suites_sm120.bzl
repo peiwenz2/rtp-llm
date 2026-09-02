@@ -31,7 +31,10 @@ def sm120_suites():
             smoke_test(
                 name = "prefill_cuda_graph_sm120",
                 task_info = "data/model/qwen25/q_r_prefill_cuda_graph.json",
-                smoke_args = "--act_type BF16 --warm_up 0 --seq_size_per_block 64 --test_block_num 1000 --concurrency_limit 5 --enable_cuda_graph 1 --decode_capture_config '1' --enable_prefill_cuda_graph 1 --prefill_cuda_graph_max_requests 5 --prefill_cuda_graph_capture_config '64,256'",
+                # Keep framework warmup enabled and let it size the production
+                # KV pool. This gates graph capture memory accounting instead of
+                # bypassing it with a fixed test_block_num.
+                smoke_args = "--act_type BF16 --warm_up 1 --seq_size_per_block 64 --concurrency_limit 5 --enable_cuda_graph 1 --decode_capture_config '1' --enable_prefill_cuda_graph 1 --prefill_cuda_graph_max_requests 5 --prefill_cuda_graph_capture_config '64,256'",
                 gpu_type = ["RTX_5000_PRO"],
                 concurrency_test = True,
             ),

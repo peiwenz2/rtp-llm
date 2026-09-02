@@ -54,26 +54,6 @@ private:
     std::string old_value_;
 };
 
-// The stream-async pipelines (RTP_LLM_STREAM_ASYNC / RTP_LLM_MTP_ASYNC_PREPARE
-// all set to 1 on the reference deployment) run the syncing prepare on a
-// dedicated worker (PyWrappedModel::prepareAttentionInputs with
-// skip_forward_event_sync=false) and keep every replay-prep mutation
-// stream-ordered, so skipping the forward-event wait there is safe. The
-// default host pipeline mutates pinned capture buffers directly from the CPU
-// (host memcpy / fill_params / fa2 replan staging), exactly like main, and
-// therefore must wait for the previous replay before touching them — main did
-// this unconditionally in prepareInputs().
-bool streamAsyncReplayPrepEnabled() {
-    static const bool enabled = []() {
-        auto is_on = [](const char* name) {
-            const char* value = std::getenv(name);
-            return value != nullptr && std::string(value) == "1";
-        };
-        return is_on("RTP_LLM_STREAM_ASYNC") || is_on("RTP_LLM_MTP_ASYNC_PREPARE");
-    }();
-    return enabled;
-}
-
 void callPrepareCudaGraph(py::object attn_pyobj, PyModelInputs& inputs) {
     if (!attn_pyobj || attn_pyobj.is_none()) {
         return;
@@ -238,7 +218,7 @@ void optimizedCopyAsync(const torch::Tensor& src, torch::Tensor& dst, size_t siz
 void CudaGraphRunner::prepareInputs(const PyModelInputs& inputs, CudaGraphState& state) {
     RTP_LLM_PROFILE_SCOPE("cuda_graph.prepareInputs");
     prepareInputData(inputs, state);
-    prepareAttentionInputs(inputs, state, /*skip_forward_event_sync=*/true);
+    prepareAttentionInputs(inputs, state);
 }
 
 void CudaGraphRunner::prepareInputData(const PyModelInputs& inputs, CudaGraphState& state) {
@@ -287,9 +267,7 @@ void CudaGraphRunner::prepareInputData(const PyModelInputs& inputs, CudaGraphSta
     }
 }
 
-void CudaGraphRunner::prepareAttentionInputs(const PyModelInputs& inputs,
-                                             CudaGraphState&      state,
-                                             bool                 skip_forward_event_sync) {
+void CudaGraphRunner::prepareAttentionInputs(const PyModelInputs& inputs, CudaGraphState& state) {
     // Captured buffers are created under InferenceMode in initCapture(). Keep
     // preparation self-contained so callers cannot accidentally mutate an
     // inference tensor from normal autograd mode (which PyTorch rejects).
@@ -306,14 +284,13 @@ void CudaGraphRunner::prepareAttentionInputs(const PyModelInputs& inputs,
     // 2.2.3 draft model do auto-agressive forward
     // for now we only support 2.2.1 and 2.2.3 in deocode cuda graph, and 2.2.2 will be support in prefill cuda graph.
 
-    // prefill currently rebuilds input_lengths/cu_seqlens/padding_offset
-    // in runner-owned pinned host buffers. Those buffers may still be the
-    // source of the previous replay's async H2D copies, so the stream-async
-    // shortcut is not safe for this role.
-    if (isGenerativePrefillCudaGraph() || !skip_forward_event_sync || !streamAsyncReplayPrepEnabled()) {
-        RTP_LLM_PROFILE_SCOPE("cuda_graph.prepareAttentionInputs(wait_forward_event)");
-        forward_event_.synchronize();
-    }
+    // Captured device tensors and pinned host mirrors may still be consumed by
+    // the previous replay. No caller currently carries an event/stream proof
+    // that those reads have completed, so wait before mutating any replay
+    // staging state. This remains correct when preparation runs on an async
+    // worker: the worker performs the wait instead of racing the graph stream.
+    RTP_LLM_PROFILE_SCOPE("cuda_graph.prepareAttentionInputs(wait_forward_event)");
+    forward_event_.synchronize();
     prepared_attention_inputs_.store(true, std::memory_order_release);
 
     const size_t graph_idx =

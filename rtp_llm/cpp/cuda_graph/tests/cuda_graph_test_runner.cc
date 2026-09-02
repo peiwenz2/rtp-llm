@@ -116,6 +116,20 @@ public:
         return runner_ != nullptr && runner_->canRun(inputs, state_, CudaGraphCheckMode::PREPARE);
     }
 
+    bool prepare(torch_ext::PyModelInputs& inputs) {
+        if (runner_ == nullptr || !runner_->canRun(inputs, state_, CudaGraphCheckMode::PREPARE)) {
+            return false;
+        }
+        // Match PyWrappedModel::prepareAttentionInputs: the graph runner reads
+        // device mirrors and top-level combo_position_ids during async prepare.
+        inputs.attention_inputs.input_lengths_device  = inputs.attention_inputs.input_lengths.cuda();
+        inputs.attention_inputs.prefix_lengths_device = inputs.attention_inputs.prefix_lengths.cuda();
+        inputs.attention_inputs.combo_position_ids    = inputs.combo_position_ids;
+        refreshTaggedAttentionInputs(inputs);
+        runner_->prepareAttentionInputs(inputs, state_);
+        return true;
+    }
+
     torch_ext::PyModelOutputs forward(torch_ext::PyModelInputs& inputs) {
         // Production PyWrappedModel creates these device mirrors. Python tests
         // cannot assign them because the bindings intentionally expose them as
@@ -190,6 +204,7 @@ PYBIND11_MODULE(libtest_cuda_graph_runner, m) {
              py::arg("position_id_len_factor") = 0)
         .def("canRun", &CudaGraphTestRunner::canRun)
         .def("canPrepare", &CudaGraphTestRunner::canPrepare)
+        .def("prepare", &CudaGraphTestRunner::prepare)
         .def("forward", &CudaGraphTestRunner::forward)
         .def("getPrefillStatus", &CudaGraphTestRunner::getPrefillStatus)
         .def("getCurrentRealGraphSize", &CudaGraphTestRunner::getCurrentRealGraphSize);

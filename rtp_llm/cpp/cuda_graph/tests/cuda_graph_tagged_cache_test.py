@@ -367,8 +367,7 @@ class TestCudaGraphTaggedCache(unittest.TestCase):
             CudaGraphSelectionMode.PREFILL_GRAPH,
         )
 
-        # Async attention preparation intentionally has no top-level position
-        # tensor yet. It may select and prepare the graph silently, while the
+        # Selection may defer position validation during PREPARE, while the
         # real forward check must still reject a request that never supplies
         # the required mRoPE positions.
         missing_positions = _build_prefill_inputs(
@@ -389,6 +388,10 @@ class TestCudaGraphTaggedCache(unittest.TestCase):
         )
         self.assertTrue(runner.canRun(inputs))
         self.assertEqual(runner.getCurrentRealGraphSize(), 4)
+        # Exercise the production split prepare -> forward path. This used to
+        # throw because PyWrappedModel only put mRoPE IDs in nested attention
+        # inputs while the graph runner validates the top-level tensor.
+        self.assertTrue(runner.prepare(inputs))
         output = runner.forward(inputs)
         torch.cuda.synchronize()
         expected = (

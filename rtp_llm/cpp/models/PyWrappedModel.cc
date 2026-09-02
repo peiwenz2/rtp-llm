@@ -763,10 +763,6 @@ torch_ext::PyMultimodalInputs PyWrappedModel::buildPyMultimodalInputs(const GptM
 }
 
 void PyWrappedModel::prepareAttentionInputs(const GptModelInputs& inputs) {
-    prepareAttentionInputs(inputs, false);
-}
-
-void PyWrappedModel::prepareAttentionInputs(const GptModelInputs& inputs, bool skip_forward_event_sync) {
     RTP_LLM_PROFILE_SCOPE("py_model.prepareAttentionInputs");
     d2d_copies_.clear();
     if (pinned_check_remaining_ > 0) {
@@ -815,7 +811,7 @@ void PyWrappedModel::prepareAttentionInputs(const GptModelInputs& inputs, bool s
     auto  empty           = torch::Tensor();
     auto  py_model_inputs = PyModelInputs({empty,
                                            empty,
-                                           empty,
+                                           attention_inputs_.combo_position_ids,
                                            torch_ext::PyEmbeddingInputs(),
                                            torch_ext::PyMultimodalInputs(),
                                            attention_inputs_,
@@ -826,7 +822,7 @@ void PyWrappedModel::prepareAttentionInputs(const GptModelInputs& inputs, bool s
     if (enable_cuda_graph_ && runner != nullptr
         && runner->canRun(py_model_inputs, state, CudaGraphCheckMode::PREPARE)) {
         RTP_LLM_PROFILE_SCOPE("py_model.prepareAttentionInputs(cuda_graph_prepare)");
-        runner->prepareAttentionInputs(py_model_inputs, state, skip_forward_event_sync);
+        runner->prepareAttentionInputs(py_model_inputs, state);
     }
 }
 
@@ -922,7 +918,7 @@ GptModelOutputs PyWrappedModel::forward(const GptModelInputs& inputs) {
         auto multimodal_inputs     = buildPyMultimodalInputs(inputs);
         auto bert_embedding_inputs = buildBertEmbeddingInputs(inputs);
         if (!prepared_attention_inputs_.load(std::memory_order_acquire)) {
-            prepareAttentionInputs(inputs, /*skip_forward_event_sync=*/true);
+            prepareAttentionInputs(inputs);
         }
         if (device_props_.enable_prefill_cp && has_context_request) {
             attention_inputs_.context_parallel_info = cp_params;
