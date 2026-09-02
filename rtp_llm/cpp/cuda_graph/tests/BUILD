@@ -115,6 +115,7 @@ py_test(
     ],
     deps = [
         ":cuda_graph_test_utils",
+        "//rtp_llm/models_py:modules",
         "//rtp_llm/test/model_test/test_util:test_util",
     ],
     env = {

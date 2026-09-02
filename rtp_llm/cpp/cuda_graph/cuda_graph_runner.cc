@@ -878,34 +878,42 @@ PyModelOutputs CudaGraphRunner::forward(const PyModelInputs& inputs, CudaGraphSt
     return outputs;
 }
 
-bool CudaGraphRunner::tryGetRealGraphPrefillSeqLen(const PyModelInputs& inputs, CudaGraphState& state) {
+bool CudaGraphRunner::tryGetRealGraphPrefillSeqLen(const PyModelInputs& inputs,
+                                                   CudaGraphState&      state,
+                                                   bool                 observe_fallback) {
     state.current_seq_len = inferTotalTokensNoSync(inputs);
     if (state.current_seq_len <= 0) {
         state.prefill_status = PrefillCudaGraphStatus::INPUT_METADATA_INVALID;
-        RTP_LLM_LOG_WARNING("prefill cuda graph: total token count is unavailable, fallback to normal run");
+        if (observe_fallback) {
+            RTP_LLM_LOG_WARNING("prefill cuda graph: total token count is unavailable, fallback to normal run");
+        }
         return false;
     }
     if (capture_range_.empty()) {
         state.prefill_status = PrefillCudaGraphStatus::CAPTURE_UNAVAILABLE;
-        RTP_LLM_LOG_WARNING("prefill cuda graph: capture_range_ is empty, cannot run");
+        if (observe_fallback) {
+            RTP_LLM_LOG_WARNING("prefill cuda graph: capture_range_ is empty, cannot run");
+        }
         return false;
     }
     auto it = std::lower_bound(capture_range_.begin(), capture_range_.end(), state.current_seq_len);
     // No captured graph for seq_len >= current (all captures smaller than requested)
     if (it == capture_range_.end()) {
         if (isGenerativePrefillCudaGraph()) {
-            state.prefill_status    = PrefillCudaGraphStatus::INPUT_TOKENS_EXCEED_CAPTURE_LIMIT;
-            const FallbackTick tick = tickFallback(prefill_cuda_graph_fallback_log_counts_[static_cast<size_t>(
-                PrefillCudaGraphStatus::INPUT_TOKENS_EXCEED_CAPTURE_LIMIT)]);
-            if (tick.should_log) {
-                RTP_LLM_LOG_WARNING("prefill CUDA graph fallback reason=input_tokens_exceed_capture_limit "
-                                    "tokens=%d max_bucket=%d "
-                                    "fallback_count=%llu",
-                                    state.current_seq_len,
-                                    capture_range_.back(),
-                                    static_cast<unsigned long long>(tick.count));
+            state.prefill_status = PrefillCudaGraphStatus::INPUT_TOKENS_EXCEED_CAPTURE_LIMIT;
+            if (observe_fallback) {
+                const FallbackTick tick = tickFallback(prefill_cuda_graph_fallback_log_counts_[static_cast<size_t>(
+                    PrefillCudaGraphStatus::INPUT_TOKENS_EXCEED_CAPTURE_LIMIT)]);
+                if (tick.should_log) {
+                    RTP_LLM_LOG_WARNING("prefill CUDA graph fallback reason=input_tokens_exceed_capture_limit "
+                                        "tokens=%d max_bucket=%d "
+                                        "fallback_count=%llu",
+                                        state.current_seq_len,
+                                        capture_range_.back(),
+                                        static_cast<unsigned long long>(tick.count));
+                }
             }
-        } else {
+        } else if (observe_fallback) {
             RTP_LLM_LOG_WARNING("prefill seq_len %d exceeds max captured %d, fallback to normal run",
                                 state.current_seq_len,
                                 capture_range_.back());
@@ -924,20 +932,26 @@ bool CudaGraphRunner::tryGetRealGraphPrefillSeqLen(const PyModelInputs& inputs, 
     return true;
 }
 
-bool CudaGraphRunner::tryGetRealGraphDecodeBatchSize(const PyModelInputs& inputs, CudaGraphState& state) {
+bool CudaGraphRunner::tryGetRealGraphDecodeBatchSize(const PyModelInputs& inputs,
+                                                     CudaGraphState&      state,
+                                                     bool                 observe_fallback) {
     int cuda_graph_bs        = inputs.attention_inputs.input_lengths.size(0);
     state.current_batch_size = cuda_graph_bs;
     RTP_LLM_LOG_DEBUG("canRun judge for batch size: %d", cuda_graph_bs);
     if (capture_range_.empty()) {
-        RTP_LLM_LOG_WARNING("decode cuda graph: capture_range_ is empty, cannot run");
+        if (observe_fallback) {
+            RTP_LLM_LOG_WARNING("decode cuda graph: capture_range_ is empty, cannot run");
+        }
         return false;
     }
     auto it = std::lower_bound(capture_range_.begin(), capture_range_.end(), state.current_batch_size);
     // No captured graph for batch >= current (all captures smaller)
     if (it == capture_range_.end()) {
-        RTP_LLM_LOG_WARNING("decode batch size %d exceeds max captured %d, fallback to normal run",
-                            state.current_batch_size,
-                            capture_range_.back());
+        if (observe_fallback) {
+            RTP_LLM_LOG_WARNING("decode batch size %d exceeds max captured %d, fallback to normal run",
+                                state.current_batch_size,
+                                capture_range_.back());
+        }
         return false;
     }
     state.current_real_graph_bs = *it;
@@ -947,7 +961,9 @@ bool CudaGraphRunner::tryGetRealGraphDecodeBatchSize(const PyModelInputs& inputs
     if (inputs.attention_inputs.is_prefill) {
         state.seq_len_sum = inferTotalTokensNoSync(inputs);
         if (state.seq_len_sum <= 0) {
-            RTP_LLM_LOG_WARNING("decode cuda graph: prefill token count is unavailable, fallback to normal run");
+            if (observe_fallback) {
+                RTP_LLM_LOG_WARNING("decode cuda graph: prefill token count is unavailable, fallback to normal run");
+            }
             return false;
         }
     } else {
@@ -966,17 +982,23 @@ bool CudaGraphRunner::validateComboPositionIds(const PyModelInputs&  inputs,
         position_id_len_factor_, token_count, inputs.combo_position_ids, captured_position_ids, copy_numel);
 }
 
-bool CudaGraphRunner::canReplaySelectedGraph(const PyModelInputs& inputs, const CudaGraphState& state) const {
+bool CudaGraphRunner::canReplaySelectedGraph(const PyModelInputs&  inputs,
+                                             const CudaGraphState& state,
+                                             CudaGraphCheckMode    mode) const {
+    const bool observe_fallback = mode == CudaGraphCheckMode::FORWARD;
     const int  graph_key = is_prefill_cuda_graph_mode_ ? state.current_real_graph_seq_len : state.current_real_graph_bs;
     const auto graph_it  = graph_instances_.find(graph_key);
     if (graph_it == graph_instances_.end()) {
-        RTP_LLM_LOG_WARNING("CUDA graph key %d was not captured, fallback to normal run", graph_key);
+        if (observe_fallback) {
+            RTP_LLM_LOG_WARNING("CUDA graph key %d was not captured, fallback to normal run", graph_key);
+        }
         return false;
     }
 
     size_t      copy_numel            = 0;
     const auto& captured_position_ids = graph_it->second.mem_hold_.py_model_inputs_.combo_position_ids;
-    if (!validateComboPositionIds(inputs, state, captured_position_ids, copy_numel)) {
+    if (mode == CudaGraphCheckMode::FORWARD
+        && !validateComboPositionIds(inputs, state, captured_position_ids, copy_numel)) {
         const FallbackTick tick = tickFallback(combo_position_fallback_count_);
         // Log the first fallback and then at powers of two. This keeps the
         // decode hot path quiet while retaining a monotonic, observable count.
@@ -1019,8 +1041,9 @@ bool CudaGraphRunner::canReplaySelectedGraph(const PyModelInputs& inputs, const 
     return true;
 }
 
-bool CudaGraphRunner::canRun(const PyModelInputs& inputs, CudaGraphState& state) {
+bool CudaGraphRunner::canRun(const PyModelInputs& inputs, CudaGraphState& state, CudaGraphCheckMode mode) {
     RTP_LLM_PROFILE_SCOPE("cuda_graph.canRun");
+    const bool observe_fallback = mode == CudaGraphCheckMode::FORWARD;
     if (!enable_cuda_graph_) {
         return false;
     }
@@ -1028,12 +1051,14 @@ bool CudaGraphRunner::canRun(const PyModelInputs& inputs, CudaGraphState& state)
         state.prefill_status = PrefillCudaGraphStatus::NOT_REQUESTED;
         auto fallback        = [&](const char* reason, PrefillCudaGraphStatus status) {
             state.prefill_status = status;
-            const FallbackTick tick =
-                tickFallback(prefill_cuda_graph_fallback_log_counts_[static_cast<size_t>(status)]);
-            if (tick.should_log) {
-                RTP_LLM_LOG_WARNING("prefill CUDA graph fallback reason=%s fallback_count=%llu",
-                                    reason,
-                                    static_cast<unsigned long long>(tick.count));
+            if (observe_fallback) {
+                const FallbackTick tick =
+                    tickFallback(prefill_cuda_graph_fallback_log_counts_[static_cast<size_t>(status)]);
+                if (tick.should_log) {
+                    RTP_LLM_LOG_WARNING("prefill CUDA graph fallback reason=%s fallback_count=%llu",
+                                        reason,
+                                        static_cast<unsigned long long>(tick.count));
+                }
             }
             return false;
         };
@@ -1145,19 +1170,26 @@ bool CudaGraphRunner::canRun(const PyModelInputs& inputs, CudaGraphState& state)
 
     if (kv_cache_group_tags_.size() > 1) {
         if (inputs.attention_inputs_by_tag.size() != kv_cache_group_tags_.size()) {
-            RTP_LLM_LOG_WARNING("Tagged kv cache size mismatch: inputs=%zu, captured=%zu, fallback to normal run.",
-                                inputs.attention_inputs_by_tag.size(),
-                                kv_cache_group_tags_.size());
+            if (observe_fallback) {
+                RTP_LLM_LOG_WARNING("Tagged kv cache size mismatch: inputs=%zu, captured=%zu, fallback to normal run.",
+                                    inputs.attention_inputs_by_tag.size(),
+                                    kv_cache_group_tags_.size());
+            }
             return false;
         }
         for (const auto& tag : kv_cache_group_tags_) {
             if (inputs.attention_inputs_by_tag.find(tag) == inputs.attention_inputs_by_tag.end()) {
-                RTP_LLM_LOG_WARNING("Tagged kv cache is missing tag=%s, fallback to normal run.", tag.c_str());
+                if (observe_fallback) {
+                    RTP_LLM_LOG_WARNING("Tagged kv cache is missing tag=%s, fallback to normal run.", tag.c_str());
+                }
                 return false;
             }
         }
     } else if (!inputs.attention_inputs_by_tag.empty()) {
-        RTP_LLM_LOG_WARNING("Tagged kv cache input does not match a single-group CUDA graph, fallback to normal run.");
+        if (observe_fallback) {
+            RTP_LLM_LOG_WARNING(
+                "Tagged kv cache input does not match a single-group CUDA graph, fallback to normal run.");
+        }
         return false;
     }
 
@@ -1165,7 +1197,7 @@ bool CudaGraphRunner::canRun(const PyModelInputs& inputs, CudaGraphState& state)
         if (!inputs.attention_inputs.is_target_verify || !inputs.attention_inputs.is_prefill) {
             return false;
         }
-        if (!tryGetRealGraphDecodeBatchSize(inputs, state)) {
+        if (!tryGetRealGraphDecodeBatchSize(inputs, state, observe_fallback)) {
             return false;
         }
         const int expected_tokens = state.current_batch_size * num_tokens_per_bs_;
@@ -1181,7 +1213,7 @@ bool CudaGraphRunner::canRun(const PyModelInputs& inputs, CudaGraphState& state)
                          expected_tokens,
                          inputs.input_hiddens.size(0));
         }
-        return canReplaySelectedGraph(inputs, state);
+        return canReplaySelectedGraph(inputs, state, mode);
     }
 
     if (inputs.attention_inputs.is_prefill && !is_prefill_cuda_graph_mode_) {
@@ -1189,15 +1221,15 @@ bool CudaGraphRunner::canRun(const PyModelInputs& inputs, CudaGraphState& state)
     }
 
     if (is_prefill_cuda_graph_mode_) {
-        if (!tryGetRealGraphPrefillSeqLen(inputs, state)) {
+        if (!tryGetRealGraphPrefillSeqLen(inputs, state, observe_fallback)) {
             return false;
         }
         // current_real_graph_seq_len is always *it from lower_bound within capture_range_
         RTP_LLM_LOG_DEBUG("prefill cuda graph replay seq_len key %d", state.current_real_graph_seq_len);
-    } else if (!tryGetRealGraphDecodeBatchSize(inputs, state)) {
+    } else if (!tryGetRealGraphDecodeBatchSize(inputs, state, observe_fallback)) {
         return false;
     }
-    const bool can_replay = canReplaySelectedGraph(inputs, state);
+    const bool can_replay = canReplaySelectedGraph(inputs, state, mode);
     if (!can_replay && isGenerativePrefillCudaGraph()
         && state.prefill_status == PrefillCudaGraphStatus::NOT_REQUESTED) {
         state.prefill_status = PrefillCudaGraphStatus::GRAPH_INPUT_SHAPE_MISMATCH;
@@ -1623,7 +1655,14 @@ void CudaGraphRunner::prepareCaptureInputs(PyModelInputs& inputs, int batch_size
     const bool fixed_capacity_draft_prefill = usesFixedCapacityMtpDraftPrefillCudaGraph();
     const int  token_slice_len = fixed_capacity_draft_prefill ? max_bs_ * num_tokens_per_bs_ : seq_len_or_tokens;
     inputs.input_ids           = capture_mem_hold_.py_model_inputs_.input_ids.slice(0, 0, token_slice_len);
-    inputs.input_hiddens       = capture_mem_hold_.py_model_inputs_.input_hiddens.slice(0, 0, token_slice_len);
+    if (isGenerativePrefillCudaGraph()) {
+        // Whole-model prefill builds embeddings from input_ids. Keep this
+        // transport-only tensor empty, matching initCapture(), instead of
+        // relying on an oversized slice of an empty tensor being clamped.
+        inputs.input_hiddens = capture_mem_hold_.py_model_inputs_.input_hiddens;
+    } else {
+        inputs.input_hiddens = capture_mem_hold_.py_model_inputs_.input_hiddens.slice(0, 0, token_slice_len);
+    }
     inputs.attention_inputs.input_lengths =
         capture_mem_hold_.py_model_inputs_.attention_inputs.input_lengths.slice(0, 0, batch_size);
     inputs.attention_inputs.input_lengths_device =

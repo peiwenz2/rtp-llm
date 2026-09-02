@@ -823,7 +823,8 @@ void PyWrappedModel::prepareAttentionInputs(const GptModelInputs& inputs, bool s
                                            torch_ext::BertEmbeddingInputs()});
     auto* runner          = selectGraphRunner(attention_inputs_);
     auto& state           = selectGraphState(attention_inputs_);
-    if (enable_cuda_graph_ && runner != nullptr && runner->canRun(py_model_inputs, state)) {
+    if (enable_cuda_graph_ && runner != nullptr
+        && runner->canRun(py_model_inputs, state, CudaGraphCheckMode::PREPARE)) {
         RTP_LLM_PROFILE_SCOPE("py_model.prepareAttentionInputs(cuda_graph_prepare)");
         runner->prepareAttentionInputs(py_model_inputs, state, skip_forward_event_sync);
     }
@@ -851,7 +852,7 @@ void PyWrappedModel::updateKVCacheKernelBlockId(const GptModelInputs& inputs) {
                                                torch_ext::BertEmbeddingInputs()});
         auto* runner          = selectGraphRunner(attention_inputs_);
         auto& state           = selectGraphState(attention_inputs_);
-        if (runner != nullptr && runner->canRun(py_model_inputs, state)) {
+        if (runner != nullptr && runner->canRun(py_model_inputs, state, CudaGraphCheckMode::PREPARE)) {
             runner->updateKVCacheKernelBlockId(py_model_inputs, state);
         }
     }

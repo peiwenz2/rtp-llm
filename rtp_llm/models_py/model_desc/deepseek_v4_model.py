@@ -56,6 +56,10 @@ from rtp_llm.models_py.modules.dsv4.moe.moe_layer import (
 )
 from rtp_llm.models_py.modules.dsv4.prefill.forward import forward_prefill
 from rtp_llm.models_py.modules.dsv4.transformer import V4Args, V4Transformer
+from rtp_llm.models_py.modules.factory.attention.attn_factory import (
+    CudaGraphSelectionMode,
+    PrefillCudaGraphUnsupportedBackend,
+)
 from rtp_llm.ops import RoleType
 from rtp_llm.utils.warmup import model_warm_up_enabled
 
@@ -1070,6 +1074,10 @@ class DeepSeekV4Model(GptModelBase):
         Prefill runs eagerly (no graph). Decode uses its own sparse/compressed
         attention; the impl owns persistent metadata buffers updated in place
         by ``prepare_cuda_graph`` between replays."""
+        if cuda_graph_selection_mode == CudaGraphSelectionMode.PREFILL_GRAPH:
+            raise PrefillCudaGraphUnsupportedBackend(
+                "DeepSeek-V4 attention does not support prefill CUDA Graph"
+            )
         if not is_cuda_graph:
             return None
 

@@ -132,7 +132,9 @@ public:
                                           CudaGraphState&      state,
                                           bool                 skip_forward_event_sync = false) override;
     void           updateKVCacheKernelBlockId(const PyModelInputs& inputs, CudaGraphState& state) override;
-    bool           canRun(const PyModelInputs& inputs, CudaGraphState& state) override;
+    bool           canRun(const PyModelInputs& inputs,
+                          CudaGraphState&      state,
+                          CudaGraphCheckMode   mode = CudaGraphCheckMode::FORWARD) override;
     void           replayGraph(int key);
     void           replayDecode(int bs);
     void           replayPrefill(int seq_len);
@@ -187,14 +189,15 @@ private:
     std::vector<int> getDecodeBatchSizesToCapture();
     std::vector<int> getPrefillSequenceLengthsToCapture();
     /// Select graph key for decode; false if no captured graph can serve current_batch_size (e.g. lower_bound hit end).
-    bool tryGetRealGraphDecodeBatchSize(const PyModelInputs& inputs, CudaGraphState& state);
+    bool tryGetRealGraphDecodeBatchSize(const PyModelInputs& inputs, CudaGraphState& state, bool observe_fallback);
     /// Select graph key for prefill; false if capture_range_ empty or seq_len above max captured (lower_bound hit end).
-    bool                    tryGetRealGraphPrefillSeqLen(const PyModelInputs& inputs, CudaGraphState& state);
-    bool                    validateComboPositionIds(const PyModelInputs&  inputs,
-                                                     const CudaGraphState& state,
-                                                     const torch::Tensor&  captured_position_ids,
-                                                     size_t&               copy_numel) const;
-    bool                    canReplaySelectedGraph(const PyModelInputs& inputs, const CudaGraphState& state) const;
+    bool tryGetRealGraphPrefillSeqLen(const PyModelInputs& inputs, CudaGraphState& state, bool observe_fallback);
+    bool validateComboPositionIds(const PyModelInputs&  inputs,
+                                  const CudaGraphState& state,
+                                  const torch::Tensor&  captured_position_ids,
+                                  size_t&               copy_numel) const;
+    bool
+    canReplaySelectedGraph(const PyModelInputs& inputs, const CudaGraphState& state, CudaGraphCheckMode mode) const;
     void                    initCaptureAttentionInputs(PyModelInputs& inputs, int max_bs, int num_tokens_per_bs);
     void                    initCaptureBertEmbeddingInputs(PyModelInputs& inputs, int max_bs, int max_num_token);
     void                    initCaptureAttentionInputsPost();

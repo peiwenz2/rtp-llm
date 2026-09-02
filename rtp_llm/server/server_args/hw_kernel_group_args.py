@@ -3,19 +3,41 @@ from typing import List
 
 from rtp_llm.server.server_args.util import str2bool
 
+_C_INT_MAX = (1 << 31) - 1
+PREFILL_CUDA_GRAPH_MAX_REQUESTS_LIMIT = 64
+PREFILL_CUDA_GRAPH_MAX_CAPTURE_TOKENS = 1 << 20
 
-def _positive_int(value: str) -> int:
+
+def _bounded_positive_int(value: str, config_name: str, maximum: int) -> int:
     import argparse
 
     try:
         parsed = int(value)
     except (TypeError, ValueError) as e:
         raise argparse.ArgumentTypeError(
-            f"expected a positive integer, got {value}"
+            f"{config_name} must be a positive integer, got {value}"
         ) from e
     if parsed <= 0:
-        raise argparse.ArgumentTypeError(f"expected a positive integer, got {value}")
+        raise argparse.ArgumentTypeError(
+            f"{config_name} must be a positive integer, got {value}"
+        )
+    if parsed > maximum:
+        raise argparse.ArgumentTypeError(
+            f"{config_name} must not exceed {maximum}, got {parsed}"
+        )
     return parsed
+
+
+def _positive_int(value: str) -> int:
+    return _bounded_positive_int(value, "value", _C_INT_MAX)
+
+
+def _prefill_cuda_graph_max_requests(value: str) -> int:
+    return _bounded_positive_int(
+        value,
+        "prefill_cuda_graph_max_requests",
+        PREFILL_CUDA_GRAPH_MAX_REQUESTS_LIMIT,
+    )
 
 
 def init_hw_kernel_group_args(parser, hw_kernel_config):
@@ -58,7 +80,7 @@ def init_hw_kernel_group_args(parser, hw_kernel_config):
         "--prefill_cuda_graph_max_requests",
         env_name="PREFILL_CUDA_GRAPH_MAX_REQUESTS",
         bind_to=(hw_kernel_config, "prefill_cuda_graph_max_requests"),
-        type=_positive_int,
+        type=_prefill_cuda_graph_max_requests,
         default=8,
         help="Prefill CUDA Graph 中真实 context sequence row 的最大数量",
     )
@@ -264,6 +286,8 @@ def _parse_prefill_capture_config(
     config: str,
     config_name: str = "prefill_capture_config",
     max_buckets: int | None = None,
+    max_bucket_value: int | None = None,
+    reject_invalid_buckets: bool = False,
 ) -> List[int]:
     """
     Parse prefill capture sequence lengths configuration string.
@@ -291,6 +315,14 @@ def _parse_prefill_capture_config(
             raise argparse.ArgumentTypeError(
                 f"{config_name} produced {len(seq_lens)} buckets; maximum is {max_buckets}"
             )
+        if max_bucket_value is not None:
+            oversized = next(
+                (bucket for bucket in seq_lens if bucket > max_bucket_value), None
+            )
+            if oversized is not None:
+                raise argparse.ArgumentTypeError(
+                    f"{config_name} bucket must not exceed {max_bucket_value}, got {oversized}"
+                )
         return seq_lens
 
     if not config:
@@ -314,10 +346,20 @@ def _parse_prefill_capture_config(
                     if line and not line.startswith("#"):
                         try:
                             seq_len = int(line)
-                            if seq_len > 0:
-                                seq_lens.append(seq_len)
-                        except ValueError:
+                        except ValueError as e:
+                            if reject_invalid_buckets:
+                                raise argparse.ArgumentTypeError(
+                                    f"{config_name} contains invalid bucket {line!r}"
+                                ) from e
                             logging.warning(f"Invalid sequence length in file: {line}")
+                            continue
+                        if seq_len <= 0:
+                            if reject_invalid_buckets:
+                                raise argparse.ArgumentTypeError(
+                                    f"{config_name} bucket must be positive, got {seq_len}"
+                                )
+                            continue
+                        seq_lens.append(seq_len)
             if seq_lens:
                 logging.info(
                     f"Loaded {len(seq_lens)} sequence lengths from {file_path}"
@@ -352,6 +394,10 @@ def _parse_prefill_capture_config(
             step = int(parts[1].strip())
             if max_seq_len <= 0 or step <= 0:
                 raise ValueError("max_seq_len and step must be positive integers")
+            if max_bucket_value is not None and max_seq_len > max_bucket_value:
+                raise argparse.ArgumentTypeError(
+                    f"{config_name} bucket must not exceed {max_bucket_value}, got {max_seq_len}"
+                )
             bucket_count = (max_seq_len + step - 1) // step
             if max_buckets is not None and bucket_count > max_buckets:
                 raise argparse.ArgumentTypeError(
@@ -376,6 +422,17 @@ def _parse_prefill_capture_config(
 
     # Mode 2: Comma-separated list (default)
     try:
+        if reject_invalid_buckets:
+            raw_values = [item.strip() for item in config.split(",") if item.strip()]
+            values = [int(item) for item in raw_values]
+            if not values:
+                raise ValueError(f"{config_name} contains no valid sequence lengths")
+            invalid = next((bucket for bucket in values if bucket <= 0), None)
+            if invalid is not None:
+                raise argparse.ArgumentTypeError(
+                    f"{config_name} bucket must be positive, got {invalid}"
+                )
+            return validate_bucket_count(values)
         return validate_bucket_count(
             _parse_comma_separated_ints(
                 config,
@@ -394,6 +451,8 @@ def _parse_prefill_cuda_graph_capture_config(config: str) -> List[int]:
         config,
         config_name="prefill_cuda_graph_capture_config",
         max_buckets=64,
+        max_bucket_value=PREFILL_CUDA_GRAPH_MAX_CAPTURE_TOKENS,
+        reject_invalid_buckets=True,
     )
 
 

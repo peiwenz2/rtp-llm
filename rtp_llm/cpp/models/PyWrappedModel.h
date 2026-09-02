@@ -244,11 +244,19 @@ inline PyWrappedModel::PyWrappedModel(const GptModelInitParams& params,
         RTP_LLM_CHECK_WITH_INFO(params.hw_kernel_config.prefill_cuda_graph_max_requests > 0,
                                 "PREFILL_CUDA_GRAPH_MAX_REQUESTS must be positive, got %d",
                                 params.hw_kernel_config.prefill_cuda_graph_max_requests);
-        const auto invalid_bucket = std::find_if(
-            buckets.begin(), buckets.end(), [&](int bucket) { return bucket <= 0 || bucket > params.max_seq_len; });
+        RTP_LLM_CHECK_WITH_INFO(params.hw_kernel_config.prefill_cuda_graph_max_requests
+                                    <= HWKernelConfig::kPrefillCudaGraphMaxRequestsLimit,
+                                "PREFILL_CUDA_GRAPH_MAX_REQUESTS must not exceed %d, got %d",
+                                HWKernelConfig::kPrefillCudaGraphMaxRequestsLimit,
+                                params.hw_kernel_config.prefill_cuda_graph_max_requests);
+        const auto invalid_bucket = std::find_if(buckets.begin(), buckets.end(), [&](int bucket) {
+            return bucket <= 0 || bucket > params.max_seq_len
+                   || bucket > HWKernelConfig::kPrefillCudaGraphMaxCaptureTokens;
+        });
         RTP_LLM_CHECK_WITH_INFO(invalid_bucket == buckets.end(),
-                                "Prefill CUDA graph buckets must be in [1, max_seq_len=%ld], got %d",
+                                "Prefill CUDA graph buckets must be in [1, min(max_seq_len=%ld, limit=%d)], got %d",
                                 params.max_seq_len,
+                                HWKernelConfig::kPrefillCudaGraphMaxCaptureTokens,
                                 invalid_bucket == buckets.end() ? 0 : *invalid_bucket);
     }
 
@@ -429,9 +437,6 @@ inline PyWrappedModel::PyWrappedModel(const GptModelInitParams& params,
                                                          static_cast<int>(params.parallelism_config.tp_size),
                                                          static_cast<int>(params.parallelism_config.tp_rank));
         }
-#else
-        RTP_LLM_CHECK_WITH_INFO(false, "CUDA/HIP Graph is only supported on CUDA/ROCm platform");
-#endif
         if (weights_.position_encoding) {
             graph_runner_->setPositionEncoding(weights_.position_encoding->kernel.cuda());
         }
@@ -558,6 +563,9 @@ inline PyWrappedModel::PyWrappedModel(const GptModelInitParams& params,
             RTP_LLM_LOG_WARNING("prefill CUDA graph disabled reason=unsupported_model wrapper_is_prefill=1");
             enable_prefill_cuda_graph_ = false;
         }
+#else
+        RTP_LLM_CHECK_WITH_INFO(false, "CUDA/HIP Graph is only supported on CUDA/ROCm platform");
+#endif
     }
 
     auto py_init_success = py_init_result.cast<bool>();

@@ -250,6 +250,9 @@ struct ProfilingDebugLoggingConfig {
 };
 
 struct HWKernelConfig {
+    static constexpr int kPrefillCudaGraphMaxRequestsLimit = 64;
+    static constexpr int kPrefillCudaGraphMaxCaptureTokens = 1 << 20;
+
     int         deep_gemm_num_sm             = -1;
     bool        arm_gemm_use_kai             = false;
     bool        enable_multi_block_mode      = true;

@@ -367,6 +367,16 @@ class TestCudaGraphTaggedCache(unittest.TestCase):
             CudaGraphSelectionMode.PREFILL_GRAPH,
         )
 
+        # Async attention preparation intentionally has no top-level position
+        # tensor yet. It may select and prepare the graph silently, while the
+        # real forward check must still reject a request that never supplies
+        # the required mRoPE positions.
+        missing_positions = _build_prefill_inputs(
+            GROUP_TAGS, {"full": 1, "aux": 2}, seq_len=[2, 2]
+        )
+        self.assertTrue(runner.canPrepare(missing_positions))
+        self.assertFalse(runner.canRun(missing_positions))
+
         # Exercise the smaller exact bucket first.
         inputs = _build_prefill_inputs(
             GROUP_TAGS, {"full": 1, "aux": 2}, seq_len=[2, 2]

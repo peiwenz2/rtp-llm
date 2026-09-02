@@ -112,6 +112,10 @@ public:
         return runner_ != nullptr && runner_->canRun(inputs, state_);
     }
 
+    bool canPrepare(torch_ext::PyModelInputs& inputs) {
+        return runner_ != nullptr && runner_->canRun(inputs, state_, CudaGraphCheckMode::PREPARE);
+    }
+
     torch_ext::PyModelOutputs forward(torch_ext::PyModelInputs& inputs) {
         // Production PyWrappedModel creates these device mirrors. Python tests
         // cannot assign them because the bindings intentionally expose them as
@@ -185,6 +189,7 @@ PYBIND11_MODULE(libtest_cuda_graph_runner, m) {
              py::arg("group_tags")             = std::vector<std::string>{},
              py::arg("position_id_len_factor") = 0)
         .def("canRun", &CudaGraphTestRunner::canRun)
+        .def("canPrepare", &CudaGraphTestRunner::canPrepare)
         .def("forward", &CudaGraphTestRunner::forward)
         .def("getPrefillStatus", &CudaGraphTestRunner::getPrefillStatus)
         .def("getCurrentRealGraphSize", &CudaGraphTestRunner::getCurrentRealGraphSize);
