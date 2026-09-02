@@ -91,6 +91,25 @@ size_t positiveDelta(size_t larger, size_t smaller) {
     return larger > smaller ? larger - smaller : 0;
 }
 
+class ScopedWarmUpCacheManagerBinding {
+public:
+    ScopedWarmUpCacheManagerBinding(ResourceContext& resource_context, std::shared_ptr<KVCacheManager> cache_manager):
+        resource_context_(resource_context), previous_cache_manager_(resource_context.cache_manager) {
+        resource_context_.cache_manager = std::move(cache_manager);
+    }
+
+    ~ScopedWarmUpCacheManagerBinding() {
+        resource_context_.cache_manager = std::move(previous_cache_manager_);
+    }
+
+    ScopedWarmUpCacheManagerBinding(const ScopedWarmUpCacheManagerBinding&)            = delete;
+    ScopedWarmUpCacheManagerBinding& operator=(const ScopedWarmUpCacheManagerBinding&) = delete;
+
+private:
+    ResourceContext&                resource_context_;
+    std::shared_ptr<KVCacheManager> previous_cache_manager_;
+};
+
 std::shared_ptr<KVCacheManager> createPrefillCudaGraphWarmUpCacheManager(const EngineInitParams& params) {
     auto cache_config = CacheConfigCreator::createBasicConfig(
         params.model_config_, params.parallelism_config, /*is_mtp=*/false, /*gen_num_per_cycle=*/0);
@@ -310,6 +329,17 @@ absl::StatusOr<GenerateStreamPtr> NormalEngine::preRun(const std::shared_ptr<Gen
         size_t seq_size_per_block = model_config_.attn_config.tokens_per_block;
         size_t reserved_blocks    = (stream->seqLength() + seq_size_per_block - 1) / seq_size_per_block + reserve_step_;
         stream->fakeInitKVBlock(reserved_blocks);
+    } else if (mode == preRunMode::prefill_warm_up && resource_context_.cache_manager) {
+        // Prefill CUDA Graph capture needs a temporary real KV pool, while the
+        // framework warmup stream deliberately does not allocate request KV
+        // blocks. Keep the model-level KV tensor and per-request block table
+        // paired by routing every logical warmup block to reserved block zero.
+        // This preserves the max-length eager warmup used for memory sizing
+        // without consuming or publishing any real cache block.
+        const size_t seq_size_per_block = resource_context_.cache_manager->cacheConfig().seq_size_per_block;
+        RTP_LLM_CHECK_WITH_INFO(seq_size_per_block > 0, "prefill CUDA graph warmup requires a positive KV block size");
+        const size_t reserved_blocks = (stream->seqLength() + seq_size_per_block - 1) / seq_size_per_block;
+        stream->fakeInitKVBlock(reserved_blocks);
     } else if (mode == preRunMode::build_system_prompt) {
         THROW_IF_STATUS_ERROR(stream->initKVBlock());
     };
@@ -414,7 +444,14 @@ WarmUpResult NormalEngine::prefillWarmUp(const EngineInitParams& params) {
 
     rtp_llm::setTraceMemory(true);
     executor_.reset(new NormalExecutor(params, warmup_cache_manager, true, false, 0, mla_ops_type_));
-    THROW_IF_STATUSOR_ERROR(preRun(fake_input, preRunMode::prefill_warm_up));
+    {
+        // NormalGenerateStream snapshots ResourceContext at construction. Bind
+        // the same temporary manager used by NormalExecutor so fakeInitKVBlock
+        // observes the captured cache topology; restore it before production
+        // cache initialization, including when preRun throws.
+        ScopedWarmUpCacheManagerBinding cache_binding(resource_context_, warmup_cache_manager);
+        THROW_IF_STATUSOR_ERROR(preRun(fake_input, preRunMode::prefill_warm_up));
+    }
     cudaDeviceSynchronize();
 
     const auto measured_status    = getGpuExecStatus().device_memory_status;
