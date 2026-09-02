@@ -20,7 +20,12 @@ from rtp_llm.model_loader.model_weight_info import (
     ModelWeights,
 )
 from rtp_llm.model_loader.tensor_source import DatabaseTensorSource, TensorCollector
-from rtp_llm.model_loader.weight_module import CustomAtomicWeight, WeightModule
+from rtp_llm.model_loader.weight_module import (
+    CompositeWeight,
+    CustomAtomicWeight,
+    QuantWeight,
+    WeightModule,
+)
 from rtp_llm.ops import TaskType, VitSeparation
 from rtp_llm.utils.database import (
     FASTSAFETENSORS_STACKED_MOE_MODE_FULL_STACKED,
@@ -820,6 +825,27 @@ class ModelLoader:
             for name, tensor in weights.items():
                 yield (None, name, tensor)
 
+    @staticmethod
+    def _fastsafetensors_load_units(weight: WeightModule) -> List[WeightModule]:
+        """Split structural containers without bypassing quant postprocessing.
+
+        QuantWeight subclasses are semantic load boundaries: their
+        ``_postprocess`` methods may repack scales or jointly transform the
+        kernel and scale. Recursing through ``get_components()`` turns those
+        objects into independent AtomicWeights and silently skips that work.
+        Structural composites such as FfnWeight and MoeWeight can still be
+        split recursively to keep each collector bounded.
+        """
+
+        if isinstance(weight, QuantWeight):
+            return [weight]
+        if isinstance(weight, CompositeWeight):
+            units = []
+            for sub_weight in weight.sub_weights.values():
+                units.extend(ModelLoader._fastsafetensors_load_units(sub_weight))
+            return units
+        return [weight]
+
     def _generate_weight_info(self) -> Tuple[Dict[str, WeightInfo], List[WeightInfo]]:
         # WeightInfo = namedtuple("WeightInfo", ["weight", "layer_id", "collector"])
         WeightInfo = ModelLoader.WeightInfo
@@ -829,11 +855,7 @@ class ModelLoader:
             for layer_id in range(self._load_config.num_layers):
                 layer_weights = self._model_weights_info.layer_weights[layer_id]
                 if isinstance(layer_weights, WeightModule):
-                    # For CompositeWeight (e.g. MoeWithSharedWeight), split into
-                    # sub-components so each gets its own collector. This prevents
-                    # large stacked MoE tensors from accumulating in a single
-                    # collector waiting for all sub-weights to arrive.
-                    for component in layer_weights.get_components():
+                    for component in self._fastsafetensors_load_units(layer_weights):
                         names = component.get_tensor_names(layer_id, self._load_config)
                         collector = TensorCollector(names, self._load_config.database)
                         weight_info = WeightInfo(
@@ -843,7 +865,7 @@ class ModelLoader:
                         weight_info_list.append(weight_info)
                 else:
                     for weight in layer_weights:
-                        for component in weight.get_components():
+                        for component in self._fastsafetensors_load_units(weight):
                             names = component.get_tensor_names(
                                 layer_id, self._load_config
                             )

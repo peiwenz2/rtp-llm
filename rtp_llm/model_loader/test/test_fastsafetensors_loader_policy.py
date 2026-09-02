@@ -25,6 +25,11 @@ from rtp_llm.model_loader.per_channel_fp8_quant_weight import (
     per_channel_cast_to_fp8_expert,
 )
 from rtp_llm.model_loader.tensor_source import DatabaseTensorSource, TensorCollector
+from rtp_llm.model_loader.weight_module import (
+    AtomicWeight,
+    CompositeWeight,
+    QuantWeight,
+)
 from rtp_llm.utils.database import (
     FASTSAFETENSORS_STACKED_MOE_MODE_ENV,
     FASTSAFETENSORS_STACKED_MOE_MODE_FULL_STACKED,
@@ -35,6 +40,42 @@ from rtp_llm.utils.model_weight import CkptWeightInfo, W, stack_, stack_moe_w1
 
 
 class TestFastsafetensorsLoaderPolicy(unittest.TestCase):
+    def test_load_units_preserve_quant_postprocess_boundary(self):
+        class StructuralWeight(CompositeWeight):
+            @classmethod
+            def support(cls, quant_config, src_weight_info):
+                return False
+
+        class SemanticQuantWeight(CompositeWeight, QuantWeight):
+            @classmethod
+            def support(cls, quant_config, src_weight_info):
+                return False
+
+        quant_kernel = AtomicWeight(
+            "quant.kernel", [CkptWeightInfo("quant.kernel", lambda ts: ts[0])]
+        )
+        quant_scale = AtomicWeight(
+            "quant.scale", [CkptWeightInfo("quant.scale", lambda ts: ts[0])]
+        )
+        quant_weight = SemanticQuantWeight(
+            {quant_kernel.name: quant_kernel, quant_scale.name: quant_scale},
+            name="quant",
+            quant_config=object(),
+        )
+        plain_weight = AtomicWeight(
+            "plain", [CkptWeightInfo("plain", lambda ts: ts[0])]
+        )
+        layer_weight = StructuralWeight(
+            {quant_weight.name: quant_weight, plain_weight.name: plain_weight},
+            name="layer",
+        )
+
+        units = ModelLoader._fastsafetensors_load_units(layer_weight)
+
+        self.assertEqual(units, [quant_weight, plain_weight])
+        self.assertNotIn(quant_kernel, units)
+        self.assertNotIn(quant_scale, units)
+
     def test_per_expert_copyout_keys_exclude_raw_stacked_keys(self):
         result = ModelLoader._build_fastsafetensors_local_copyout_keys(
             {"direct.weight": object(), "expanded.experts.0": object()},
