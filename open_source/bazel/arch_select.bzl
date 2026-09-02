@@ -71,6 +71,10 @@ def subscribe_deps():
 
 def whl_deps():
     return select({
+        "@//:using_cuda12_9_x86": [
+            "fast-safetensors@https://rtp-opensource.oss-cn-hangzhou.aliyuncs.com/rtp_llm/cu129/fast_safetensors-0.7.4.dev0%2Btorch2.8.0.cu129.aone68234507-cp310-cp310-linux_x86_64.whl#sha256=f930efd369f57ef36e216cb93fb2398cfdc3454e6b6b918eeea1556e5e62ec62",
+            "fastsafetensors@https://rtp-opensource.oss-cn-hangzhou.aliyuncs.com/rtp_llm/cu129/fastsafetensors-0.3.4.dev20260901%2Bali.fuseshm.g78ac75c8.aone67880226-cp310-cp310-linux_x86_64.whl#sha256=bb084a01e6b3d97a8790e583cb5c0fcadcef1960e64b069bb2a97fff0079fe40",
+        ],
         "@//:using_cuda12": ["torch==2.6.0+cu126"],
         "@//:using_rocm": ["pyrsmi==0.2.0", "amdsmi@https://sinian-metrics-platform.oss-cn-hangzhou.aliyuncs.com/kis%2FAMD%2Famd_smi%2Fali%2Famd_smi.tar", "aiter@https://sinian-metrics-platform.oss-cn-hangzhou.aliyuncs.com/kis/AMD/RTP/aiter-0.1.13.dev14%2Bgfa35072d0.d20260402-cp310-cp310-linux_x86_64.whl"],
         "//conditions:default": ["torch==2.1.2"],
