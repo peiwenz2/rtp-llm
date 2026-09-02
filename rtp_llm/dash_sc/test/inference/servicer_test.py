@@ -17,7 +17,6 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-import rtp_llm.dash_sc.inference.servicer as servicer_module
 from rtp_llm.config.exceptions import ExceptionType, FtRuntimeException
 from rtp_llm.config.generate_config import RoleAddr
 from rtp_llm.dash_sc.access_log import DASH_SC_GRPC_ACCESS_LOGGER_NAME
@@ -308,84 +307,7 @@ class IterRealModelStreamInferTest(unittest.IsolatedAsyncioTestCase):
             {"reasoning_effort": "xhigh"},
         )
 
-    async def test_pretokenized_tool_controls_reach_model_constraint_hook(self) -> None:
-        req = self._minimal_request()
-        req.parameters["ds_header_attributes"].string_param = json.dumps(
-            {
-                "payload": {
-                    "parameters": {
-                        "tools": [
-                            {
-                                "type": "function",
-                                "function": {
-                                    "name": "bash",
-                                    "parameters": {"type": "object"},
-                                },
-                            }
-                        ],
-                        "tool_choice": "auto",
-                    }
-                }
-            }
-        )
-        out = GenerateOutput(
-            output_ids=torch.tensor([3], dtype=torch.int32),
-            finished=True,
-            aux_info=AuxInfo(input_len=2, reuse_len=0),
-        )
-        visitor = _FakeVisitor(
-            _FakeAsyncStream([GenerateOutputs(generate_outputs=[out])])
-        )
-        observed = {}
-
-        def apply_constraint(controls, generate_config, thinking):
-            observed.update(controls)
-            observed["thinking"] = thinking
-            generate_config.structural_tag = json.dumps(
-                {
-                    "type": "structural_tag",
-                    "format": {"type": "const_string", "value": "x"},
-                }
-            )
-            generate_config.in_think_mode = False
-            return "test_request_tools"
-
-        with self.assertLogs(level="INFO") as captured:
-            chunks = await _drain(
-                iter_real_model_stream_infer(
-                    req,
-                    [1, 2],
-                    SamplingParams(),
-                    OtherParams(enable_thinking=True),
-                    visitor,
-                    rtp_llm_request_id=1,
-                    pretokenized_chat_constraint_applier=apply_constraint,
-                )
-            )
-
-        self.assertEqual(len(chunks), 1)
-        self.assertEqual(observed["tool_choice"], "auto")
-        self.assertEqual(observed["tools"][0]["function"]["name"], "bash")
-        self.assertFalse(visitor.last_generate_input.generate_config.in_think_mode)
-        self.assertIsNotNone(visitor.last_generate_input.generate_config.structural_tag)
-        diagnostic = _single_grammar_request_log(captured.output)
-        self.assertTrue(diagnostic["constraint_resolution"]["python_applier_called"])
-        self.assertEqual(
-            diagnostic["constraint_resolution"]["python_applier_result"],
-            "test_request_tools",
-        )
-        self.assertEqual(
-            diagnostic["constraint_resolution"]["final_structural_tag"]["source"],
-            "rtp_python_fallback:test_request_tools",
-        )
-        self.assertEqual(
-            diagnostic["constraint_resolution"]["final_structural_tag"]["parsed"][
-                "format"
-            ]["value"],
-            "x",
-        )
-
-    async def test_request_parameter_log_reports_fields_and_sources(self) -> None:
+    async def test_request_parameter_log_does_not_promote_tool_metadata(self) -> None:
         req = self._minimal_request()
         req.parameters["temperature"].string_param = "0.5"
         req.parameters["ds_header_attributes"].string_param = json.dumps(
@@ -435,23 +357,11 @@ class IterRealModelStreamInferTest(unittest.IsolatedAsyncioTestCase):
         diagnostic = _single_grammar_request_log(captured.output)
         self.assertEqual(diagnostic["path"], "dashsc")
         self.assertIn("temperature", diagnostic["request_parameter_fields"])
-        self.assertEqual(
-            diagnostic["chat_control_sources"]["tools"],
-            "request.parameters.ds_header_attributes.payload.parameters.tools",
-        )
-        tool = diagnostic["chat_controls"]["tools"][0]["function"]
-        self.assertEqual(tool["name"], "lookup")
-        self.assertEqual(tool["description"], "private description")
-        self.assertEqual(tool["parameters"]["secret"], "do-not-log")
-        self.assertEqual(diagnostic["chat_controls"]["tool_choice"], "auto")
-        self.assertEqual(
-            diagnostic["ds_header_grammar_controls"][
-                "request.parameters.ds_header_attributes.x-ds-llm-tool-choice"
-            ],
-            "none",
-        )
+        self.assertNotIn("chat_controls", diagnostic)
+        self.assertNotIn("chat_control_sources", diagnostic)
+        self.assertEqual(diagnostic["ds_header_grammar_controls"], {})
 
-    async def test_request_structural_tag_log_preserves_wire_and_skips_fallback(
+    async def test_request_structural_tag_log_preserves_wire_and_reaches_generate_config(
         self,
     ) -> None:
         req = self._minimal_request()
@@ -473,9 +383,6 @@ class IterRealModelStreamInferTest(unittest.IsolatedAsyncioTestCase):
             _FakeAsyncStream([GenerateOutputs(generate_outputs=[out])])
         )
 
-        def unexpected_fallback(*_args):
-            self.fail("request structural_tag must bypass the Python fallback")
-
         with self.assertLogs(level="INFO") as captured:
             await _drain(
                 iter_real_model_stream_infer(
@@ -485,7 +392,6 @@ class IterRealModelStreamInferTest(unittest.IsolatedAsyncioTestCase):
                     OtherParams(enable_thinking=True),
                     visitor,
                     rtp_llm_request_id=1,
-                    pretokenized_chat_constraint_applier=unexpected_fallback,
                 )
             )
 
@@ -500,98 +406,13 @@ class IterRealModelStreamInferTest(unittest.IsolatedAsyncioTestCase):
             request_tag["parsed"]["format"]["value"],
             "request-tag-exact-value",
         )
-        self.assertFalse(diagnostic["constraint_resolution"]["python_applier_called"])
+        self.assertNotIn(
+            "python_applier_called", diagnostic["constraint_resolution"]
+        )
         self.assertEqual(
             diagnostic["constraint_resolution"]["final_structural_tag"]["source"],
             "request:request.parameters.tool_call_structural_tag",
         )
-
-    async def test_pretokenized_stringified_tools_reach_constraint_hook(self) -> None:
-        req = self._minimal_request()
-        tools = [
-            {
-                "type": "function",
-                "function": {
-                    "name": "bash",
-                    "parameters": {"type": "object"},
-                },
-            }
-        ]
-        req.parameters["ds_header_attributes"].string_param = json.dumps(
-            {"tools": json.dumps(tools), "tool_choice": '"auto"'}
-        )
-        out = GenerateOutput(
-            output_ids=torch.tensor([3], dtype=torch.int32),
-            finished=True,
-            aux_info=AuxInfo(input_len=2, reuse_len=0),
-        )
-        visitor = _FakeVisitor(
-            _FakeAsyncStream([GenerateOutputs(generate_outputs=[out])])
-        )
-        observed = {}
-
-        def apply_constraint(controls, generate_config, thinking):
-            observed.update(controls)
-            return None
-
-        await _drain(
-            iter_real_model_stream_infer(
-                req,
-                [1, 2],
-                SamplingParams(),
-                OtherParams(enable_thinking=True),
-                visitor,
-                rtp_llm_request_id=1,
-                pretokenized_chat_constraint_applier=apply_constraint,
-            )
-        )
-
-        self.assertEqual(observed["tools"], tools)
-        self.assertEqual(observed["tool_choice"], "auto")
-
-    async def test_pretokenized_fallback_warning_is_rate_limited(self) -> None:
-        req = self._minimal_request()
-
-        def apply_constraint(controls, generate_config, thinking):
-            return "common_prompt_tail_fallback"
-
-        with patch.dict(
-            servicer_module._PRETOKENIZED_CHAT_FALLBACK_LOG_COUNTS,
-            {},
-            clear=True,
-        ), self.assertLogs(level="WARNING") as captured:
-            for _ in range(3):
-                out = GenerateOutput(
-                    output_ids=torch.tensor([3], dtype=torch.int32),
-                    finished=True,
-                    aux_info=AuxInfo(input_len=2, reuse_len=0),
-                )
-                visitor = _FakeVisitor(
-                    _FakeAsyncStream([GenerateOutputs(generate_outputs=[out])])
-                )
-                await _drain(
-                    iter_real_model_stream_infer(
-                        req,
-                        [1, 2],
-                        SamplingParams(),
-                        OtherParams(),
-                        visitor,
-                        rtp_llm_request_id=1,
-                        pretokenized_chat_constraint_applier=apply_constraint,
-                    )
-                )
-
-        fallback_logs = [
-            message
-            for message in captured.output
-            if "pretokenized chat constraint fallback" in message
-        ]
-        self.assertEqual(len(fallback_logs), 2)
-        self.assertIn("fallback=common_prompt_tail_fallback", fallback_logs[0])
-        self.assertIn("missing=tools,tool_choice,parallel_tool_calls", fallback_logs[0])
-        self.assertIn("sources=none", fallback_logs[0])
-        self.assertIn("occurrences=1", fallback_logs[0])
-        self.assertIn("occurrences=2", fallback_logs[1])
 
     async def test_finished_at_max_new_tokens_reports_length_repro_p1(self) -> None:
         req = self._minimal_request()

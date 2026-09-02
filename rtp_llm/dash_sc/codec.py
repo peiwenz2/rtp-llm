@@ -31,11 +31,6 @@ _INT32_MAX = 2_147_483_647
 _DEFAULT_MAX_NEW_TOKENS = 32000
 _PACK_EOS_FOR_EMPTY_GENERATED_IDS_ENV = "DASH_SC_PACK_EOS_FOR_EMPTY_GENERATED_IDS"
 _TRUE_ENV_VALUES = frozenset({"1", "true", "yes", "on"})
-PRETOKENIZED_CHAT_CONTROL_NAMES = (
-    "tools",
-    "tool_choice",
-    "parallel_tool_calls",
-)
 
 
 def _pack_eos_for_empty_generated_ids() -> bool:
@@ -307,84 +302,6 @@ def parse_ds_header_attributes(request) -> dict[str, Any]:
     if not isinstance(attrs, dict):
         return {}
     return {str(k).lower(): v for k, v in attrs.items()}
-
-
-def parse_pretokenized_chat_controls(
-    request, ds_attrs: dict[str, Any] | None = None
-) -> dict[str, Any]:
-    controls, _ = parse_pretokenized_chat_controls_with_sources(request, ds_attrs)
-    return controls
-
-
-def parse_pretokenized_chat_controls_with_sources(
-    request, ds_attrs: dict[str, Any] | None = None
-) -> tuple[dict[str, Any], dict[str, str]]:
-    """Return chat controls retained alongside an already-tokenized prompt.
-
-    DashScope sends the rendered ``input_ids`` to RTP-LLM, so the ordinary
-    OpenAI renderer never sees the request-level tool contract.  Preserve the
-    semantic controls that a model renderer needs to build its decoding
-    grammar.  Direct ``ModelInferRequest.parameters`` values win, followed by
-    ``ds_header_attributes`` and the legacy ``parameters['payload']`` envelope.
-    """
-    attrs = ds_attrs if ds_attrs is not None else parse_ds_header_attributes(request)
-    controls: dict[str, Any] = {}
-    sources: dict[str, str] = {}
-    for name in PRETOKENIZED_CHAT_CONTROL_NAMES:
-        value = _parse_pretokenized_chat_parameter(request, name)
-        if value is not None:
-            sources[name] = f"request.parameters.{name}"
-        else:
-            value, source = _lookup_ds_request_control_with_source(attrs, name)
-            if value is not None:
-                sources[name] = str(source)
-        if value is not None:
-            controls[name] = _decode_pretokenized_chat_control(value)
-
-    if all(name in controls for name in PRETOKENIZED_CHAT_CONTROL_NAMES):
-        return controls, sources
-
-    payload, payload_parameter_name = _load_multimodal_payload_with_source(request)
-    if not isinstance(payload, dict):
-        return controls, sources
-    for name in PRETOKENIZED_CHAT_CONTROL_NAMES:
-        if name in controls:
-            continue
-        value, source = _lookup_ds_request_control_with_source(
-            payload,
-            name,
-            f"request.parameters.{payload_parameter_name}",
-        )
-        if value is not None:
-            controls[name] = _decode_pretokenized_chat_control(value)
-            sources[name] = str(source)
-    return controls, sources
-
-
-def _parse_pretokenized_chat_parameter(request, name: str) -> Any:
-    if name not in request.parameters:
-        return None
-    parameter = request.parameters[name]
-    if parameter.HasField("string_param"):
-        return parameter.string_param
-    if parameter.HasField("bool_param"):
-        return bool(parameter.bool_param)
-    if parameter.HasField("int64_param"):
-        return int(parameter.int64_param)
-    return None
-
-
-def _decode_pretokenized_chat_control(value: Any) -> Any:
-    """Decode controls that legacy forwarders preserve as JSON strings."""
-    if not isinstance(value, str):
-        return value
-    text = value.strip()
-    if not text:
-        return value
-    try:
-        return json.loads(text)
-    except (TypeError, ValueError):
-        return value
 
 
 def _dict_get_case_insensitive(value: Any, key: str) -> Any:
@@ -1364,12 +1281,6 @@ def _load_multimodal_payload(request) -> Any:
     ``None`` when neither is present / both are empty / JSON decoding fails.
     Fail-open on JSON errors — caller will treat ``None`` as "no multimodal".
     """
-    payload, _ = _load_multimodal_payload_with_source(request)
-    return payload
-
-
-def _load_multimodal_payload_with_source(request) -> tuple[Any, str | None]:
-    """Return the decoded body and the request.parameters key that carried it."""
     for key in _MULTIMODAL_PARAMETER_KEYS:
         if key not in request.parameters:
             continue
@@ -1377,15 +1288,15 @@ def _load_multimodal_payload_with_source(request) -> tuple[Any, str | None]:
         if not param.HasField("string_param") or not param.string_param:
             continue
         try:
-            return json.loads(param.string_param), key
+            return json.loads(param.string_param)
         except (TypeError, ValueError) as e:
             logging.warning(
                 "failed to parse multimodal payload JSON from parameters[%r]: %s",
                 key,
                 e,
             )
-            return None, key
-    return None, None
+            return None
+    return None
 
 
 def parse_multimodal_parts_from_request(request) -> list[MultimodalPart]:

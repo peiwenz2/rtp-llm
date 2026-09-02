@@ -18,7 +18,6 @@ import inspect
 import hashlib
 import json
 import logging
-import threading
 from dataclasses import dataclass
 from typing import Any, AsyncIterator, Callable, Iterator, Optional
 
@@ -41,7 +40,6 @@ from rtp_llm.dash_sc.codec import (
     DASH_ERROR_TIMEOUT,
     DASH_ERROR_TOO_LONG,
     DASH_ERROR_UNSUPPORTED,
-    PRETOKENIZED_CHAT_CONTROL_NAMES,
     DashErrorSpec,
     DashScParameterError,
     LLMFinishReason,
@@ -54,7 +52,6 @@ from rtp_llm.dash_sc.codec import (
     parse_dash_sc_grpc_request,
     parse_ds_header_attributes,
     parse_multimodal_parts_from_request,
-    parse_pretokenized_chat_controls_with_sources,
     prepend_to_generated_ids_tensor,
 )
 from rtp_llm.dash_sc.grpc_metrics import (
@@ -87,22 +84,16 @@ _EMPTY_THINK_BODY = "\n"
 _DEFAULT_TERMINATE_TOKEN_ID = 1
 _INT32_MAX = 2_147_483_647
 _PARTIAL_RESPONSE_METADATA = (("x-dashscope-partialresponse", "true"),)
-_PRETOKENIZED_CHAT_FALLBACK_LOG_COUNTS: dict[tuple[Any, ...], int] = {}
-_PRETOKENIZED_CHAT_FALLBACK_LOG_LOCK = threading.Lock()
 _GRAMMAR_CONTROL_KEYS = frozenset(
     {
         "enable_thinking",
         "guided_json",
         "json_format",
-        "parallel_tool_calls",
         "response_format",
         "structural_tag",
         "thinking_budget",
         "tool_call_structural_tag",
-        "tool_choice",
-        "tools",
         "x-ds-llm-thinking",
-        "x-ds-llm-tool-choice",
     }
 )
 
@@ -160,11 +151,7 @@ def _log_dashsc_request_parameters(
     sampling: SamplingParams,
     other: OtherParams,
     ds_attrs: dict[str, Any],
-    chat_controls: dict[str, Any],
-    chat_control_sources: dict[str, str],
     generate_config: GenerateConfig,
-    constraint_applier_called: bool,
-    constraint_source: Optional[str],
 ) -> None:
     """Log exact grammar controls without logging prompt/messages or unrelated headers."""
     request_structural_tag = _serialized_value_diagnostics(sampling.structural_tag)
@@ -178,10 +165,8 @@ def _log_dashsc_request_parameters(
     final_structural_tag = _serialized_value_diagnostics(generate_config.structural_tag)
     if sampling.structural_tag is not None:
         final_source = f"request:{sampling.structural_tag_source or 'unknown'}"
-    elif constraint_applier_called and generate_config.structural_tag is not None:
-        final_source = f"rtp_python_fallback:{constraint_source or 'unspecified'}"
     else:
-        final_source = "none_before_cpp_factory"
+        final_source = "none"
     final_structural_tag["source"] = final_source
 
     summary = {
@@ -192,15 +177,11 @@ def _log_dashsc_request_parameters(
             str(getattr(request_input, "name", "")) for request_input in request.inputs
         ),
         "ds_header_grammar_controls": _selected_ds_header_controls_for_log(ds_attrs),
-        "chat_controls": chat_controls,
-        "chat_control_sources": chat_control_sources,
         "enable_thinking": other.enable_thinking,
         "response_format": response_format,
         "json_format": sampling.json_format,
         "request_structural_tag": request_structural_tag,
         "constraint_resolution": {
-            "python_applier_called": constraint_applier_called,
-            "python_applier_result": constraint_source,
             "final_in_think_mode": bool(
                 getattr(generate_config, "in_think_mode", False)
             ),
@@ -211,47 +192,6 @@ def _log_dashsc_request_parameters(
         "[DashScGrpc] [%s] [grammar-request] %s",
         tag,
         json.dumps(summary, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
-    )
-
-
-def _log_pretokenized_chat_constraint_fallback(
-    tag: str,
-    fallback_type: str,
-    controls: dict[str, Any],
-    sources: dict[str, str],
-) -> None:
-    """Log fallback diagnostics at exponentially decreasing frequency.
-
-    The fingerprint contains only field names and source labels. Tool schemas
-    and values are deliberately excluded from both the key and the log body.
-    """
-    missing_fields = tuple(
-        name for name in PRETOKENIZED_CHAT_CONTROL_NAMES if name not in controls
-    )
-    source_fields = tuple(
-        (name, sources[name])
-        for name in PRETOKENIZED_CHAT_CONTROL_NAMES
-        if name in sources
-    )
-    fingerprint = (fallback_type, missing_fields, source_fields)
-    with _PRETOKENIZED_CHAT_FALLBACK_LOG_LOCK:
-        occurrences = _PRETOKENIZED_CHAT_FALLBACK_LOG_COUNTS.get(fingerprint, 0) + 1
-        _PRETOKENIZED_CHAT_FALLBACK_LOG_COUNTS[fingerprint] = occurrences
-
-    # Emit at occurrences 1, 2, 4, 8, ... so persistent failures remain
-    # observable without producing one warning per request.
-    if occurrences & (occurrences - 1):
-        return
-    missing = ",".join(missing_fields) or "none"
-    source_summary = ",".join(f"{name}:{source}" for name, source in source_fields)
-    logging.warning(
-        "[DashScGrpc] [%s] pretokenized chat constraint fallback: "
-        "fallback=%s missing=%s sources=%s occurrences=%d",
-        tag,
-        fallback_type,
-        missing,
-        source_summary or "none",
-        occurrences,
     )
 
 
@@ -721,7 +661,6 @@ async def iter_real_model_stream_infer(
     phase2_request_id_factory: Optional[Callable[[], int]] = None,
     access_agg: Any = None,
     mm_inputs: Optional[list] = None,
-    pretokenized_chat_constraint_applier: Optional[Callable] = None,
     yield_access_stats: bool = False,
 ) -> AsyncIterator[predict_v2_pb2.ModelStreamInferResponse]:
     """Run enqueue on ``backend_visitor`` and yield one proto per chunk as the backend streams.
@@ -756,9 +695,6 @@ async def iter_real_model_stream_infer(
     tag = stream_log_tag(request_id_numeric=rtp_llm_request_id, trace_id=trace_str)
     runtime = think_runtime if think_runtime is not None else _ThinkRuntime()
     ds_attrs = parse_ds_header_attributes(request)
-    chat_controls, chat_control_sources = parse_pretokenized_chat_controls_with_sources(
-        request, ds_attrs
-    )
     logging.debug(
         "[DashScGrpc] [%s] real infer start: model_name=%s input_len=%s sampling=%s",
         tag,
@@ -797,37 +733,13 @@ async def iter_real_model_stream_infer(
         ):
             generate_config.end_think_token_ids = list(runtime.eos_tokens)
         _apply_request_overrides(generate_config, sampling, other, runtime)
-        constraint_applier_called = False
-        constraint_source = None
-        if (
-            pretokenized_chat_constraint_applier is not None
-            and generate_config.structural_tag is None
-        ):
-            constraint_applier_called = True
-            constraint_source = pretokenized_chat_constraint_applier(
-                chat_controls,
-                generate_config,
-                bool(getattr(generate_config, "in_think_mode", False)),
-            )
-            fallback_type = constraint_source or "common_prompt_tail_fallback"
-            if fallback_type == "common_prompt_tail_fallback":
-                _log_pretokenized_chat_constraint_fallback(
-                    tag,
-                    fallback_type,
-                    chat_controls,
-                    chat_control_sources,
-                )
         _log_dashsc_request_parameters(
             request,
             tag,
             sampling,
             other,
             ds_attrs,
-            chat_controls,
-            chat_control_sources,
             generate_config,
-            constraint_applier_called,
-            constraint_source,
         )
         if extra_stop_word_ids:
             existing = generate_config.stop_words_list
@@ -1399,7 +1311,6 @@ class DashScInferenceServicer(predict_v2_pb2_grpc.GRPCInferenceServiceServicer):
         think_runtime: Optional[_ThinkRuntime] = None,
         rank_id: Optional[int] = None,
         repetition_monitor_config: Optional[RequestRepetitionMonitorConfig] = None,
-        pretokenized_chat_constraint_applier: Optional[Callable] = None,
     ):
         self._backend_visitor = backend_visitor
         self._ip = ip
@@ -1430,9 +1341,6 @@ class DashScInferenceServicer(predict_v2_pb2_grpc.GRPCInferenceServiceServicer):
         self._rank_id = rank_id
         self._server_id = to_optional_int(server_id)
         self._rep_cfg = repetition_monitor_config or RequestRepetitionMonitorConfig()
-        self._pretokenized_chat_constraint_applier = (
-            pretokenized_chat_constraint_applier
-        )
 
     def _record_and_report_chunk(
         self,
@@ -1654,9 +1562,6 @@ class DashScInferenceServicer(predict_v2_pb2_grpc.GRPCInferenceServiceServicer):
                         phase2_request_id_factory=self._next_rtp_llm_request_id,
                         access_agg=record,
                         mm_inputs=mm_inputs,
-                        pretokenized_chat_constraint_applier=(
-                            self._pretokenized_chat_constraint_applier
-                        ),
                         yield_access_stats=True,
                     ):
                         (
