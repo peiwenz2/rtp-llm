@@ -167,15 +167,14 @@ final class RouteProjectionTestSupport {
                 NOW_MS, requests, batches, unknownRequestCount);
     }
 
-    static RouteProjection.Result project(
+    static RouteProjection.Candidate project(
             QueueSnapshot queue,
             WorkSnapshot work,
             PrefillTimePredictor.Evaluator evaluator,
             RouteProjection.Probe probe,
             RouteProjection.DeliveryProjection deliveryProjection) {
         return candidate(
-                queue, work, evaluator, probe, deliveryProjection, 0L)
-                .projection();
+                queue, work, evaluator, probe, deliveryProjection, 0L);
     }
 
     static RouteProjection.Candidate candidate(

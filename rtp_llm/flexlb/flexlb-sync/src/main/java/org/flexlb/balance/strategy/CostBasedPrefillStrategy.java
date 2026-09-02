@@ -136,7 +136,7 @@ public class CostBasedPrefillStrategy {
                 }
 
                 boolean modeledSelection =
-                        selectedCandidates.candidate(0).projection().selectable();
+                        selectedCandidates.candidate(0).selectable();
                 final int selectedIndex;
                 if (modeledSelection) {
                     // Numeric TTFT policies see only candidates with a complete model.
@@ -193,14 +193,14 @@ public class CostBasedPrefillStrategy {
                                 selectedIndex,
                                 roleType,
                                 requestId,
-                                selectedCandidate.projection().projectedTtftMs(),
+                                selectedCandidate.projectedTtftMs(),
                                 selectedPrefillMs,
                                 bestCacheHit);
                 reportSelectedEstimates(
                         roleType,
                         best,
                         config,
-                        selectedCandidate.projection().projectedTtftMs(),
+                        selectedCandidate.projectedTtftMs(),
                         selectedPrefillMs);
                 return PlacementResult.success(selectedRole);
             }
@@ -705,15 +705,15 @@ public class CostBasedPrefillStrategy {
         private static final class Entry {
             private final String endpointAddress;
             private WorkerEndpoint.GenerationPin pin;
-            private final RouteProjection.Candidate projection;
+            private final RouteProjection.Candidate candidate;
 
             private Entry(
                     String endpointAddress,
                     WorkerEndpoint.GenerationPin pin,
-                    RouteProjection.Candidate projection) {
+                    RouteProjection.Candidate candidate) {
                 this.endpointAddress = endpointAddress;
                 this.pin = pin;
-                this.projection = projection;
+                this.candidate = candidate;
             }
 
             private String endpointAddress() {
@@ -724,8 +724,8 @@ public class CostBasedPrefillStrategy {
                 return pin;
             }
 
-            private RouteProjection.Candidate projection() {
-                return projection;
+            private RouteProjection.Candidate candidate() {
+                return candidate;
             }
         }
 
@@ -752,19 +752,19 @@ public class CostBasedPrefillStrategy {
         private void addCandidate(
                 String endpointAddress,
                 WorkerEndpoint.GenerationPin pin,
-                RouteProjection.Candidate projection) {
+                RouteProjection.Candidate candidate) {
             entries.add(new Entry(
                     endpointAddress,
                     pin,
-                    projection));
+                    candidate));
         }
 
         private RouteProjection.Candidate candidate(int index) {
-            RouteProjection.Candidate projection = entries.get(index).projection();
-            if (projection == null) {
+            RouteProjection.Candidate candidate = entries.get(index).candidate();
+            if (candidate == null) {
                 throw new IllegalStateException("endpoint has not been projected");
             }
-            return projection;
+            return candidate;
         }
 
         private PrefillEndpoint endpoint(int index) {
@@ -780,7 +780,7 @@ public class CostBasedPrefillStrategy {
         }
 
         private long projectedTtftMs(int index) {
-            return candidate(index).projectedTtftMs();
+            return candidate(index).projectedTtftMs().orElseThrow();
         }
 
         private long prefillMs(int index) {
@@ -876,20 +876,19 @@ public class CostBasedPrefillStrategy {
                                 predictor == null
                                         ? null : predictor.evaluator(),
                                 ep.deliveryProjection());
-                boolean modeledProjection = projection.projection().selectable();
+                boolean modeledProjection = projection.selectable();
                 boolean unmodeledProjection = projection.engineWorkUnmodeled();
                 if (!modeledProjection && !unmodeledProjection) {
-                    RoleType blockerRole =
-                            projection.projection().blockerRole();
+                    RoleType blockerRole = projection.blockerRole();
                     if (blockerRole != null) {
                         poolWideBlockers.merge(
                                 blockerRole, 1, Integer::sum);
                     }
                     rejections.merge(
                             "PROJECTION_"
-                                    + projection.projection().state().name()
+                                    + projection.state().name()
                                     + "_"
-                                    + projection.projection().detail(),
+                                    + projection.detail(),
                             1,
                             Integer::sum);
                     continue;

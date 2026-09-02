@@ -19,7 +19,14 @@ final class RouteTimelineProjector {
 
     private static final String INVALID_PREDICTION_DETAIL =
             "PREDICTOR_RETURNED_INVALID_VALUE";
-    private RouteTimelineProjector() {
+    private final RouteProjection.Probe incoming;
+    private final long pendingRequestCount;
+
+    RouteTimelineProjector(
+            RouteProjection.Probe incoming,
+            long pendingRequestCount) {
+        this.incoming = incoming;
+        this.pendingRequestCount = pendingRequestCount;
     }
 
     /**
@@ -29,10 +36,9 @@ final class RouteTimelineProjector {
      * and that cursor overlap via {@code max(cursor, readyAt)}. The snapshot's
      * frozen delivery projection defines each group's completion shape.
      */
-    static RouteProjection.Result project(
+    RouteProjection.Candidate project(
             QueueSnapshot queue,
             WorkSnapshot committed,
-            RouteProjection.Probe incoming,
             PrefillTimePredictor.Evaluator evaluator,
             RouteProjection.DeliveryProjection deliveryProjection) {
         long projectionAtMs = queue.capturedAtMs();
@@ -47,17 +53,16 @@ final class RouteTimelineProjector {
         PredictionBoundary predictions = new PredictionBoundary(evaluator);
         try {
             return projectWithPredictions(
-                    queue, committed, incoming, deliveryProjection,
+                    queue, committed, deliveryProjection,
                     projectionAtMs, predictions);
         } catch (PredictionFailure predictionFailure) {
             return unavailable(predictionFailure.detail("PREDICTION_FAILED"));
         }
     }
 
-    private static RouteProjection.Result projectWithPredictions(
+    private RouteProjection.Candidate projectWithPredictions(
             QueueSnapshot queue,
             WorkSnapshot committed,
-            RouteProjection.Probe incoming,
             RouteProjection.DeliveryProjection deliveryProjection,
             long projectionAtMs,
             PredictionBoundary predictions) {
@@ -84,7 +89,7 @@ final class RouteTimelineProjector {
                 if (!incomingShape.fitsKv(queue.constraints().batchKvCapacity())) {
                     return blocked(
                             incomingPrefillMs,
-                            RouteProjection.Result.InitialHeadDisposition.NONE,
+                            RouteProjection.Candidate.InitialHeadDisposition.NONE,
                             "PREFILL_KV_CAPACITY");
                 }
             }
@@ -95,22 +100,22 @@ final class RouteTimelineProjector {
 
         if (!queue.queueScheduling()) {
             long completionMs = saturatedAdd(committedMs, incomingPrefillMs);
-            return new RouteProjection.Result(
-                    RouteProjection.Result.State.MODELED,
+            return candidate(
+                    RouteProjection.Candidate.State.MODELED,
                     OptionalLong.of(completionMs),
                     incoming.demand().drainRequired()
                             ? OptionalLong.of(completionMs)
                             : OptionalLong.empty(),
                     incomingPrefillMs,
-                    RouteProjection.Result.InitialHeadDisposition.NONE,
+                    RouteProjection.Candidate.InitialHeadDisposition.NONE,
                     "SERIAL_FROZEN_DIRECT");
         }
         GroupPlanner.Item probe = incoming.asItem();
         GroupPlanner.Item initialActiveHead =
                 queue.activeItems().isEmpty() ? null : queue.activeItems().getFirst();
-        RouteProjection.Result.InitialHeadDisposition initialHeadDisposition =
+        RouteProjection.Candidate.InitialHeadDisposition initialHeadDisposition =
                 initialActiveHead == null
-                        ? RouteProjection.Result.InitialHeadDisposition.NONE
+                        ? RouteProjection.Candidate.InitialHeadDisposition.NONE
                         : null;
         List<GroupPlanner.Item> eligibleActive = new ArrayList<>(
                 queue.activeItems().size());
@@ -120,7 +125,7 @@ final class RouteTimelineProjector {
             if (expiredAt(item, projectionAtMs)) {
                 if (item == initialActiveHead) {
                     initialHeadDisposition =
-                            RouteProjection.Result.InitialHeadDisposition.TERMINAL_PRUNED;
+                            RouteProjection.Candidate.InitialHeadDisposition.TERMINAL_PRUNED;
                 }
                 continue;
             }
@@ -149,7 +154,7 @@ final class RouteTimelineProjector {
             ExpirationPrune expiration = ordered.pruneExpired(decisionNowMs);
             if (expiration.initialHeadExpired()) {
                 initialHeadDisposition =
-                        RouteProjection.Result.InitialHeadDisposition.TERMINAL_PRUNED;
+                        RouteProjection.Candidate.InitialHeadDisposition.TERMINAL_PRUNED;
             }
             if (expiration.probeExpired()) {
                 return unavailable("INCOMING_EXPIRED_BEFORE_DISPATCH");
@@ -263,8 +268,8 @@ final class RouteTimelineProjector {
             throw new IllegalStateException(
                     "projected queue exhausted before planning the probe");
         }
-        return new RouteProjection.Result(
-                RouteProjection.Result.State.MODELED,
+        return candidate(
+                RouteProjection.Candidate.State.MODELED,
                 OptionalLong.of(probeCompletionMs),
                 drainKnown ? OptionalLong.of(cursorMs) : OptionalLong.empty(),
                 incomingPrefillMs,
@@ -272,12 +277,12 @@ final class RouteTimelineProjector {
                 drainDetail);
     }
 
-    private static RouteProjection.Result modeledTtftOnly(
+    private RouteProjection.Candidate modeledTtftOnly(
             long probeCompletionMs,
             long incomingPrefillMs,
-            RouteProjection.Result.InitialHeadDisposition initialHeadDisposition) {
-        return new RouteProjection.Result(
-                RouteProjection.Result.State.MODELED,
+            RouteProjection.Candidate.InitialHeadDisposition initialHeadDisposition) {
+        return candidate(
+                RouteProjection.Candidate.State.MODELED,
                 OptionalLong.of(probeCompletionMs),
                 OptionalLong.empty(),
                 incomingPrefillMs,
@@ -420,14 +425,14 @@ final class RouteTimelineProjector {
             return live.isEmpty();
         }
 
-        private RouteProjection.Result.InitialHeadDisposition
+        private RouteProjection.Candidate.InitialHeadDisposition
                 initialHeadDisposition() {
             if (initialHeadNode == null) {
-                return RouteProjection.Result.InitialHeadDisposition.TERMINAL_PRUNED;
+                return RouteProjection.Candidate.InitialHeadDisposition.TERMINAL_PRUNED;
             }
             return initialHeadNode.ordinal < probeNode.ordinal
-                    ? RouteProjection.Result.InitialHeadDisposition.BEFORE_PROBE
-                    : RouteProjection.Result.InitialHeadDisposition.AFTER_PROBE;
+                    ? RouteProjection.Candidate.InitialHeadDisposition.BEFORE_PROBE
+                    : RouteProjection.Candidate.InitialHeadDisposition.AFTER_PROBE;
         }
 
         private GroupPlanner.Item head() {
@@ -517,30 +522,48 @@ final class RouteTimelineProjector {
         return deadlineMs <= nowMs ? 0L : deadlineMs - nowMs;
     }
 
-    private static RouteProjection.Result unavailable(String detail) {
-        return new RouteProjection.Result(
-                RouteProjection.Result.State.UNAVAILABLE,
+    private RouteProjection.Candidate unavailable(String detail) {
+        return candidate(
+                RouteProjection.Candidate.State.UNAVAILABLE,
                 OptionalLong.empty(), OptionalLong.empty(), 0L,
-                RouteProjection.Result.InitialHeadDisposition.NONE, detail);
+                RouteProjection.Candidate.InitialHeadDisposition.NONE, detail);
     }
 
-    private static RouteProjection.Result unmodeledEngineWork(
+    private RouteProjection.Candidate unmodeledEngineWork(
             long incomingPrefillMs) {
-        return new RouteProjection.Result(
-                RouteProjection.Result.State.UNMODELED_ENGINE_WORK,
+        return candidate(
+                RouteProjection.Candidate.State.UNMODELED_ENGINE_WORK,
                 OptionalLong.empty(), OptionalLong.empty(), incomingPrefillMs,
-                RouteProjection.Result.InitialHeadDisposition.NONE,
+                RouteProjection.Candidate.InitialHeadDisposition.NONE,
                 "ENGINE_WORK_UNOBSERVABLE");
     }
 
-    private static RouteProjection.Result blocked(
+    private RouteProjection.Candidate blocked(
             long incomingPrefillMs,
-            RouteProjection.Result.InitialHeadDisposition initialHeadDisposition,
+            RouteProjection.Candidate.InitialHeadDisposition initialHeadDisposition,
             String detail) {
-        return new RouteProjection.Result(
-                RouteProjection.Result.State.BLOCKED,
+        return candidate(
+                RouteProjection.Candidate.State.BLOCKED,
                 OptionalLong.empty(), OptionalLong.empty(), incomingPrefillMs,
                 initialHeadDisposition, detail);
+    }
+
+    private RouteProjection.Candidate candidate(
+            RouteProjection.Candidate.State state,
+            OptionalLong projectedTtftMs,
+            OptionalLong projectedDrainMs,
+            long incomingPrefillMs,
+            RouteProjection.Candidate.InitialHeadDisposition headDisposition,
+            String detail) {
+        boolean carriesPending = state == RouteProjection.Candidate.State.MODELED
+                || state == RouteProjection.Candidate.State.UNMODELED_ENGINE_WORK;
+        return new RouteProjection.Candidate(
+                state, projectedTtftMs, projectedDrainMs, incomingPrefillMs,
+                headDisposition, detail, null,
+                incoming.hitCache(), incoming.routingCacheMatchTokens(),
+                carriesPending
+                        ? OptionalLong.of(pendingRequestCount)
+                        : OptionalLong.empty());
     }
 
     private static long saturatedAdd(long left, long right) {

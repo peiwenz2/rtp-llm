@@ -39,7 +39,7 @@ class RouteProjectionTest {
                         1L, WorkSnapshot.Phase.ENGINE_RUNNING, 100L)),
                 List.of(), 0L);
 
-        RouteProjection.Result result = project(
+        RouteProjection.Candidate result = project(
                 queue(false, constraints(4, 30L), List.of()),
                 committed,
                 TOKEN_EVALUATOR,
@@ -53,7 +53,7 @@ class RouteProjectionTest {
 
     @Test
     void singleRequestGroupNeverPaysCollectionWindow() {
-        RouteProjection.Result result = project(
+        RouteProjection.Candidate result = project(
                 queue(false, constraints(1, 30L), List.of()),
                 noCommittedWork(),
                 TOKEN_EVALUATOR,
@@ -70,7 +70,7 @@ class RouteProjectionTest {
                 item(1L, 50, 1L, 10L),
                 item(2L, 50, 2L, 10L));
 
-        RouteProjection.Result result = project(
+        RouteProjection.Candidate result = project(
                 queue(false, constraints(2, 30L), active),
                 noCommittedWork(),
                 TOKEN_EVALUATOR,
@@ -96,7 +96,7 @@ class RouteProjectionTest {
                         WorkSnapshot.Phase.ENGINE_RUNNING, 40L)),
                 0L);
 
-        RouteProjection.Result result = project(
+        RouteProjection.Candidate result = project(
                 queue(false, false, constraints(1, 0L), List.of(), null),
                 committed,
                 TOKEN_EVALUATOR,
@@ -127,18 +127,18 @@ class RouteProjectionTest {
                 99L, 90, 20L, 0L,
                 RouteProjection.Demand.TTFT_AND_DRAIN);
 
-        RouteProjection.Result fifo = project(
+        RouteProjection.Candidate fifo = project(
                 queue(false, constraints(2, 0L), active),
                 noCommittedWork(), TOKEN_EVALUATOR, probe, BATCH);
-        RouteProjection.Result priority = project(
+        RouteProjection.Candidate priority = project(
                 queue(true, constraints(2, 0L), active),
                 noCommittedWork(), TOKEN_EVALUATOR, probe, BATCH);
 
         assertModeled(fifo, 130L, 130L);
         assertModeled(priority, 30L, 130L);
-        assertEquals(RouteProjection.Result.InitialHeadDisposition
+        assertEquals(RouteProjection.Candidate.InitialHeadDisposition
                 .BEFORE_PROBE, fifo.initialHeadDisposition());
-        assertEquals(RouteProjection.Result.InitialHeadDisposition
+        assertEquals(RouteProjection.Candidate.InitialHeadDisposition
                 .BEFORE_PROBE, priority.initialHeadDisposition());
     }
 
@@ -148,7 +148,7 @@ class RouteProjectionTest {
                 item(1L, 100, 1L, 10L),
                 item(2L, 10, 2L, 100L));
 
-        RouteProjection.Result result = project(
+        RouteProjection.Candidate result = project(
                 queue(true, constraints(3, 0L), active),
                 noCommittedWork(), TOKEN_EVALUATOR,
                 probe(99L, 90, 20L, 0L,
@@ -164,7 +164,7 @@ class RouteProjectionTest {
                 item(1L, 100, 1L, 10L),
                 item(2L, 10, 2L, 100L));
 
-        RouteProjection.Result result = project(
+        RouteProjection.Candidate result = project(
                 queue(true, constraints(3, 0L), active),
                 noCommittedWork(), TOKEN_EVALUATOR,
                 probe(99L, 90, 20L, 0L,
@@ -195,12 +195,12 @@ class RouteProjectionTest {
                 warmProbe, ROUTE, 8L);
 
         assertEquals(1_000L, cold.incomingPrefillMs());
-        assertEquals(1_000L, cold.projectedTtftMs());
+        assertEquals(OptionalLong.of(1_000L), cold.projectedTtftMs());
         assertEquals(0L, cold.cacheHitTokens());
         assertEquals(123L, cold.routingCacheMatchTokens());
         assertEquals(7L, cold.requiredPendingCount());
         assertEquals(440L, warm.incomingPrefillMs());
-        assertEquals(440L, warm.projectedTtftMs());
+        assertEquals(OptionalLong.of(440L), warm.projectedTtftMs());
         assertEquals(800L, warm.cacheHitTokens());
         assertEquals(900L, warm.routingCacheMatchTokens());
         assertEquals(8L, warm.requiredPendingCount());
@@ -214,7 +214,7 @@ class RouteProjectionTest {
                         .mapToLong(PrefillBatchFeatures.Item::seqLen)
                         .sum());
 
-        RouteProjection.Result result = project(
+        RouteProjection.Candidate result = project(
                 queue(true, constraints(1, 0L), List.of()),
                 noCommittedWork(), invalid,
                 probe(99L, 50, 20L, 0L,
@@ -235,7 +235,7 @@ class RouteProjectionTest {
                     (tokens, hits) -> tokens,
                     ignored -> invalidValue);
 
-            RouteProjection.Result result = project(
+            RouteProjection.Candidate result = project(
                     queue(true, constraints(1, 0L), List.of()),
                     noCommittedWork(), invalid,
                     probe(99L, 50, 20L, 0L,
@@ -255,7 +255,7 @@ class RouteProjectionTest {
                 (tokens, hits) -> tokens,
                 ignored -> Double.NaN);
 
-        RouteProjection.Result result = project(
+        RouteProjection.Candidate result = project(
                 queue(true, predictionBounded, List.of()),
                 noCommittedWork(), invalid,
                 probe(99L, 50, 20L, 0L,
@@ -276,11 +276,11 @@ class RouteProjectionTest {
                 ROUTE,
                 9L);
 
-        assertEquals(RouteProjection.Result.State.UNMODELED_ENGINE_WORK,
-                candidate.projection().state());
+        assertEquals(RouteProjection.Candidate.State.UNMODELED_ENGINE_WORK,
+                candidate.state());
         assertEquals("ENGINE_WORK_UNOBSERVABLE",
-                candidate.projection().detail());
-        assertFalse(candidate.projection().selectable());
+                candidate.detail());
+        assertFalse(candidate.selectable());
         assertTrue(candidate.engineWorkUnmodeled());
         assertEquals(9L, candidate.requiredPendingCount());
         assertEquals(20L, candidate.incomingPrefillMs());
@@ -297,14 +297,14 @@ class RouteProjectionTest {
                         OptionalLong.empty())),
                 0L);
 
-        RouteProjection.Result result = project(
+        RouteProjection.Candidate result = project(
                 queue(true, constraints(1, 0L), List.of()),
                 unknown, TOKEN_EVALUATOR,
                 probe(99L, 50, 20L, 0L,
                         RouteProjection.Demand.TTFT_AND_DRAIN),
                 ROUTE);
 
-        assertEquals(RouteProjection.Result.State.UNMODELED_ENGINE_WORK,
+        assertEquals(RouteProjection.Candidate.State.UNMODELED_ENGINE_WORK,
                 result.state());
         assertEquals("ENGINE_WORK_UNOBSERVABLE", result.detail());
         assertFalse(result.selectable());
@@ -312,7 +312,7 @@ class RouteProjectionTest {
 
     @Test
     void nonPositiveExistingExpiryIsTerminalAndDoesNotBlockProbe() {
-        RouteProjection.Result result = project(
+        RouteProjection.Candidate result = project(
                 queue(false, constraints(1, 0L), List.of(
                         item(1L, 50, 1L, 100L, 0L))),
                 noCommittedWork(), TOKEN_EVALUATOR,
@@ -321,13 +321,13 @@ class RouteProjectionTest {
                 ROUTE);
 
         assertModeled(result, 20L, 20L);
-        assertEquals(RouteProjection.Result.InitialHeadDisposition
+        assertEquals(RouteProjection.Candidate.InitialHeadDisposition
                 .TERMINAL_PRUNED, result.initialHeadDisposition());
     }
 
     @Test
     void probeExpiringExactlyAtCollectionDeadlineIsNotDispatched() {
-        RouteProjection.Result result = project(
+        RouteProjection.Candidate result = project(
                 queue(false, constraints(4, 30L), List.of()),
                 noCommittedWork(), TOKEN_EVALUATOR,
                 probe(99L, 50, NOW_MS, NOW_MS + 30L,
@@ -335,14 +335,14 @@ class RouteProjectionTest {
                         RouteProjection.Demand.TTFT_AND_DRAIN),
                 BATCH);
 
-        assertEquals(RouteProjection.Result.State.UNAVAILABLE, result.state());
+        assertEquals(RouteProjection.Candidate.State.UNAVAILABLE, result.state());
         assertEquals("INCOMING_EXPIRED_BEFORE_DISPATCH", result.detail());
         assertFalse(result.selectable());
     }
 
     @Test
     void existingMemberExpiringInsideWindowIsRemovedBeforeService() {
-        RouteProjection.Result result = project(
+        RouteProjection.Candidate result = project(
                 queue(false, constraints(4, 30L), List.of(
                         item(1L, 50, 1L, 10L, NOW_MS + 10L))),
                 noCommittedWork(), TOKEN_EVALUATOR,
@@ -351,7 +351,7 @@ class RouteProjectionTest {
                 BATCH);
 
         assertModeled(result, 50L, 50L);
-        assertEquals(RouteProjection.Result.InitialHeadDisposition
+        assertEquals(RouteProjection.Candidate.InitialHeadDisposition
                 .TERMINAL_PRUNED, result.initialHeadDisposition());
     }
 
@@ -360,13 +360,13 @@ class RouteProjectionTest {
         GroupPlanner.Constraints strict = new GroupPlanner.Constraints(
                 1, 100L, 1_000_000L, 0L, 0L);
 
-        RouteProjection.Result afterInvalidHead = project(
+        RouteProjection.Candidate afterInvalidHead = project(
                 queue(false, strict, List.of(item(1L, 50, 1L, 100L))),
                 noCommittedWork(), TOKEN_EVALUATOR,
                 probe(99L, 50, 20L, 0L,
                         RouteProjection.Demand.TTFT_AND_DRAIN),
                 ROUTE);
-        RouteProjection.Result invalidProbe = project(
+        RouteProjection.Candidate invalidProbe = project(
                 queue(false, strict, List.of()),
                 noCommittedWork(), TOKEN_EVALUATOR,
                 probe(100L, 50, 100L, 0L,
@@ -374,14 +374,14 @@ class RouteProjectionTest {
                 ROUTE);
 
         assertModeled(afterInvalidHead, 120L, 120L);
-        assertEquals(RouteProjection.Result.InitialHeadDisposition
+        assertEquals(RouteProjection.Candidate.InitialHeadDisposition
                 .BEFORE_PROBE, afterInvalidHead.initialHeadDisposition());
         assertModeled(invalidProbe, 100L, 100L);
     }
 
     @Test
     void routeSuffixFailureDoesNotEraseEstablishedProbeTtft() {
-        RouteProjection.Result result = project(
+        RouteProjection.Candidate result = project(
                 queue(true, constraints(3, 0L), List.of(
                         item(1L, 100, 1L, 10L),
                         item(2L, 10, 2L, 999L))),
@@ -390,7 +390,7 @@ class RouteProjectionTest {
                         RouteProjection.Demand.TTFT_AND_DRAIN),
                 ROUTE);
 
-        assertEquals(RouteProjection.Result.State.MODELED, result.state());
+        assertEquals(RouteProjection.Candidate.State.MODELED, result.state());
         assertEquals(OptionalLong.of(30L), result.projectedTtftMs());
         assertEquals(OptionalLong.empty(), result.projectedDrainMs());
         assertEquals("DRAIN_PREDICTION_UNAVAILABLE", result.detail());
@@ -398,7 +398,7 @@ class RouteProjectionTest {
 
     @Test
     void ttftOnlyNeverTouchesRouteSuffixAfterProbeCompletion() {
-        RouteProjection.Result result = project(
+        RouteProjection.Candidate result = project(
                 queue(true, constraints(3, 0L), List.of(
                         item(1L, 100, 1L, 10L),
                         item(2L, 10, 2L, 999L))),
@@ -407,7 +407,7 @@ class RouteProjectionTest {
                         RouteProjection.Demand.TTFT_ONLY),
                 ROUTE);
 
-        assertEquals(RouteProjection.Result.State.MODELED, result.state());
+        assertEquals(RouteProjection.Candidate.State.MODELED, result.state());
         assertEquals(OptionalLong.of(30L), result.projectedTtftMs());
         assertEquals(OptionalLong.empty(), result.projectedDrainMs());
         assertEquals("SERIAL_FROZEN_QUEUE_TTFT_ONLY", result.detail());
@@ -415,7 +415,7 @@ class RouteProjectionTest {
 
     @Test
     void ttftOnlyNeverTouchesLaterBatchGroup() {
-        RouteProjection.Result result = project(
+        RouteProjection.Candidate result = project(
                 queue(true, constraints(1, 0L), List.of(
                         item(1L, 10, 1L, 999L))),
                 noCommittedWork(), suffixFailingBatchEvaluator(),
@@ -423,14 +423,14 @@ class RouteProjectionTest {
                         RouteProjection.Demand.TTFT_ONLY),
                 BATCH);
 
-        assertEquals(RouteProjection.Result.State.MODELED, result.state());
+        assertEquals(RouteProjection.Candidate.State.MODELED, result.state());
         assertEquals(OptionalLong.of(20L), result.projectedTtftMs());
         assertEquals(OptionalLong.empty(), result.projectedDrainMs());
     }
 
     @Test
     void invalidLaterBatchPredictionKeepsTtftButMakesDrainUnknown() {
-        RouteProjection.Result result = project(
+        RouteProjection.Candidate result = project(
                 queue(true, constraints(1, 0L), List.of(
                         item(1L, 10, 1L, 999L))),
                 noCommittedWork(), suffixFailingBatchEvaluator(),
@@ -438,7 +438,7 @@ class RouteProjectionTest {
                         RouteProjection.Demand.TTFT_AND_DRAIN),
                 BATCH);
 
-        assertEquals(RouteProjection.Result.State.MODELED, result.state());
+        assertEquals(RouteProjection.Candidate.State.MODELED, result.state());
         assertEquals(OptionalLong.of(20L), result.projectedTtftMs());
         assertEquals(OptionalLong.empty(), result.projectedDrainMs());
         assertEquals("DRAIN_PREDICTION_UNAVAILABLE", result.detail());
@@ -460,10 +460,10 @@ class RouteProjectionTest {
                 100L, 90, NOW_MS - 30L, Long.MAX_VALUE,
                 20L, 0L, RouteProjection.Demand.TTFT_AND_DRAIN);
 
-        RouteProjection.Result ttftOnly = project(
+        RouteProjection.Candidate ttftOnly = project(
                 snapshot, noCommittedWork(), TOKEN_EVALUATOR,
                 ttftProbe, ROUTE);
-        RouteProjection.Result withDrain = project(
+        RouteProjection.Candidate withDrain = project(
                 snapshot, noCommittedWork(), TOKEN_EVALUATOR,
                 drainProbe, ROUTE);
 
@@ -477,7 +477,7 @@ class RouteProjectionTest {
         GroupPlanner.Constraints kvLimited = new GroupPlanner.Constraints(
                 1, 1_000_000L, 50L, 0L, 30L);
 
-        RouteProjection.Result result = project(
+        RouteProjection.Candidate result = project(
                 queue(true, kvLimited, List.of(
                         item(1L, 10, 1L, 100L))),
                 noCommittedWork(), TOKEN_EVALUATOR,
@@ -485,24 +485,24 @@ class RouteProjectionTest {
                         RouteProjection.Demand.TTFT_AND_DRAIN),
                 ROUTE);
 
-        assertEquals(RouteProjection.Result.State.MODELED, result.state());
+        assertEquals(RouteProjection.Candidate.State.MODELED, result.state());
         assertEquals(OptionalLong.of(20L), result.projectedTtftMs());
         assertEquals(OptionalLong.empty(), result.projectedDrainMs());
         assertEquals("DRAIN_BLOCKED_PREFILL_KV_CAPACITY", result.detail());
-        assertEquals(RouteProjection.Result.InitialHeadDisposition.AFTER_PROBE,
+        assertEquals(RouteProjection.Candidate.InitialHeadDisposition.AFTER_PROBE,
                 result.initialHeadDisposition());
     }
 
     @Test
     void duplicateIncomingIdentityIsRejectedAtActiveAndCommittedBoundaries() {
-        RouteProjection.Result active = project(
+        RouteProjection.Candidate active = project(
                 queue(false, constraints(1, 0L), List.of(
                         item(99L, 50, 1L, 20L))),
                 noCommittedWork(), TOKEN_EVALUATOR,
                 probe(99L, 50, 20L, 0L,
                         RouteProjection.Demand.TTFT_AND_DRAIN),
                 ROUTE);
-        RouteProjection.Result committed = project(
+        RouteProjection.Candidate committed = project(
                 queue(false, constraints(1, 0L), List.of()),
                 work(List.of(new WorkSnapshot.RequestWork(
                                 99L,
@@ -514,9 +514,9 @@ class RouteProjectionTest {
                         RouteProjection.Demand.TTFT_AND_DRAIN),
                 ROUTE);
 
-        assertEquals(RouteProjection.Result.State.UNAVAILABLE, active.state());
+        assertEquals(RouteProjection.Candidate.State.UNAVAILABLE, active.state());
         assertEquals("INCOMING_ALREADY_ACTIVE", active.detail());
-        assertEquals(RouteProjection.Result.State.UNAVAILABLE,
+        assertEquals(RouteProjection.Candidate.State.UNAVAILABLE,
                 committed.state());
         assertEquals("INCOMING_ALREADY_COMMITTED", committed.detail());
     }
@@ -537,7 +537,7 @@ class RouteProjectionTest {
                             .sum();
                 });
 
-        RouteProjection.Result result = project(
+        RouteProjection.Candidate result = project(
                 queue(false,
                         new GroupPlanner.Constraints(
                                 1, 1_000_000L, 1_000_000L,
@@ -555,17 +555,17 @@ class RouteProjectionTest {
     }
 
     private static void assertModeled(
-            RouteProjection.Result result,
+            RouteProjection.Candidate result,
             long ttftMs,
             long drainMs) {
-        assertEquals(RouteProjection.Result.State.MODELED, result.state());
+        assertEquals(RouteProjection.Candidate.State.MODELED, result.state());
         assertEquals(OptionalLong.of(ttftMs), result.projectedTtftMs());
         assertEquals(OptionalLong.of(drainMs), result.projectedDrainMs());
         assertTrue(result.selectable());
     }
 
-    private static void assertInvalidPrediction(RouteProjection.Result result) {
-        assertEquals(RouteProjection.Result.State.UNAVAILABLE, result.state());
+    private static void assertInvalidPrediction(RouteProjection.Candidate result) {
+        assertEquals(RouteProjection.Candidate.State.UNAVAILABLE, result.state());
         assertEquals("PREDICTOR_RETURNED_INVALID_VALUE", result.detail());
         assertEquals(OptionalLong.empty(), result.projectedTtftMs());
         assertEquals(OptionalLong.empty(), result.projectedDrainMs());

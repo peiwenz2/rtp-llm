@@ -34,7 +34,7 @@ class RouteProjectionTest {
                 evaluator,
                 routeProjection());
 
-        assertTrue(result.projection().selectable());
+        assertTrue(result.selectable());
         assertEquals(7L, result.requiredPendingCount());
         assertEquals(20L, result.incomingPrefillMs());
         assertTrue(evaluator.invocations() > 0);
@@ -62,54 +62,45 @@ class RouteProjectionTest {
                 probe(RouteProjection.Demand.TTFT_AND_DRAIN),
                 captured,
                 routeProjection());
-        assertTrue(result.projection().selectable());
+        assertTrue(result.selectable());
         assertEquals(before, captured.estimateMs(20L, 0L),
                 "a projection-owned evaluator cannot change mid-call");
     }
 
     @Test
     void candidatePendingCountExistsExactlyForUsableProjection() {
-        RouteProjection.Result modeled = new RouteProjection.Result(
-                RouteProjection.Result.State.MODELED,
-                OptionalLong.of(10L),
-                OptionalLong.empty(),
-                10L,
-                RouteProjection.Result.InitialHeadDisposition.NONE,
-                "MODELED");
-        RouteProjection.Result unmodeled = new RouteProjection.Result(
-                RouteProjection.Result.State.UNMODELED_ENGINE_WORK,
-                OptionalLong.empty(),
-                OptionalLong.empty(),
-                0L,
-                RouteProjection.Result.InitialHeadDisposition.NONE,
-                "UNMODELED");
-        RouteProjection.Result unavailable = new RouteProjection.Result(
-                RouteProjection.Result.State.UNAVAILABLE,
-                OptionalLong.empty(),
-                OptionalLong.empty(),
-                0L,
-                RouteProjection.Result.InitialHeadDisposition.NONE,
-                "UNAVAILABLE");
-
+        assertThrows(IllegalArgumentException.class,
+                () -> candidate(RouteProjection.Candidate.State.MODELED,
+                        OptionalLong.of(10L), OptionalLong.empty()));
+        assertThrows(IllegalArgumentException.class,
+                () -> candidate(RouteProjection.Candidate.State.UNAVAILABLE,
+                        OptionalLong.empty(), OptionalLong.of(1L)));
         assertThrows(IllegalArgumentException.class,
                 () -> new RouteProjection.Candidate(
-                        modeled, 0L, 0L, OptionalLong.empty()));
-        assertThrows(IllegalArgumentException.class,
-                () -> new RouteProjection.Candidate(
-                        unavailable, 0L, 0L, OptionalLong.of(1L)));
-        assertThrows(IllegalArgumentException.class,
-                () -> new RouteProjection.Candidate(
-                        modeled, -1L, 0L, OptionalLong.of(1L)));
+                        RouteProjection.Candidate.State.MODELED,
+                        OptionalLong.of(-1L), OptionalLong.empty(), 0L,
+                        RouteProjection.Candidate.InitialHeadDisposition.NONE,
+                        "invalid", null, 0L, 0L, OptionalLong.of(1L)));
 
         RouteProjection.Candidate modeledCandidate =
-                new RouteProjection.Candidate(
-                        modeled, 0L, 0L, OptionalLong.of(1L));
+                candidate(RouteProjection.Candidate.State.MODELED,
+                        OptionalLong.of(10L), OptionalLong.of(20L));
         RouteProjection.Candidate unmodeledCandidate =
-                new RouteProjection.Candidate(
-                        unmodeled, 0L, 0L, OptionalLong.of(2L));
-        assertEquals(1L, modeledCandidate.requiredPendingCount());
+                candidate(RouteProjection.Candidate.State.UNMODELED_ENGINE_WORK,
+                        OptionalLong.empty(), OptionalLong.of(2L));
+        assertEquals(20L, modeledCandidate.requiredPendingCount());
         assertEquals(2L, unmodeledCandidate.requiredPendingCount());
         assertTrue(unmodeledCandidate.engineWorkUnmodeled());
+    }
+
+    private static RouteProjection.Candidate candidate(
+            RouteProjection.Candidate.State state,
+            OptionalLong projectedTtftMs,
+            OptionalLong pendingCount) {
+        return new RouteProjection.Candidate(
+                state, projectedTtftMs, OptionalLong.empty(), 0L,
+                RouteProjection.Candidate.InitialHeadDisposition.NONE,
+                state.name(), null, 0L, 0L, pendingCount);
     }
 
     private static RouteProjection.Inputs inputs(
