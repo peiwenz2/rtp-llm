@@ -872,41 +872,6 @@ public final class WorkerBatcher {
                 item.hitCache());
     }
 
-    private ActiveQueueState activeQueueState() {
-        queueLock.lock();
-        try {
-            ScheduledRequest head = queue.peek();
-            long oldestEnqueuedAtMs = Long.MAX_VALUE;
-            for (ScheduledRequest item : queue) {
-                oldestEnqueuedAtMs = Math.min(
-                        oldestEnqueuedAtMs, item.enqueuedAtMs());
-            }
-            return new ActiveQueueState(
-                    queueVersion.get(), schedulingInputVersion.get(),
-                    head, queue.size(), oldestEnqueuedAtMs);
-        } finally {
-            queueLock.unlock();
-        }
-    }
-
-    private record ActiveQueueState(
-            long queueVersion,
-            long schedulingInputVersion,
-            ScheduledRequest head,
-            int activeSize,
-            long oldestEnqueuedAtMs) {
-    }
-
-    private static BatcherCycleResult awaitingSchedulingChange(
-            ScheduledRequest head,
-            long observedQueueVersion,
-            long observedSchedulingInputVersion,
-            long wakeAtMs) {
-        return BatcherCycleResult.awaitingSchedulingChange(
-                head, observedQueueVersion, observedSchedulingInputVersion,
-                wakeAtMs);
-    }
-
     private BatchCapacitySnapshot batchCapacitySnapshot() {
         long capacity = positiveOrUnlimited(
                 config.getInternalRuntime()
@@ -1046,8 +1011,7 @@ public final class WorkerBatcher {
         }
         String committedReason = null;
         int remainingQueueDepth = 0;
-        RemovedTerminalBoundary removedBoundary =
-                RemovedTerminalBoundary.NONE;
+        boolean removedTerminalBoundary = false;
         Throwable postCommitFailure = null;
         queueLock.lock();
         try {
@@ -1063,7 +1027,7 @@ public final class WorkerBatcher {
             }
             transaction.commitUnderLock();
             try {
-                removedBoundary = removeSelectionBoundaryUnderLock(
+                removedTerminalBoundary = removeSelectionBoundaryUnderLock(
                         transaction.blockedItem(),
                         transaction.blockedResult(), nowMs);
                 queueVersion.incrementAndGet();
@@ -1081,7 +1045,10 @@ public final class WorkerBatcher {
         if (postCommitFailure != null) {
             Throwable failure = postCommitFailure;
             try {
-                notifyTerminalAdmissionFailure(removedBoundary);
+                notifyTerminalAdmissionFailure(
+                        removedTerminalBoundary,
+                        transaction.blockedItem(),
+                        transaction.blockedResult());
             } catch (Throwable notificationFailure) {
                 failure = appendFailure(failure, notificationFailure);
             }
@@ -1092,7 +1059,10 @@ public final class WorkerBatcher {
             }
             throw propagateCommitFailure(failure);
         }
-        notifyTerminalAdmissionFailure(removedBoundary);
+        notifyTerminalAdmissionFailure(
+                removedTerminalBoundary,
+                transaction.blockedItem(),
+                transaction.blockedResult());
         handoff(transaction, Objects.requireNonNull(committedReason),
                 remainingQueueDepth);
         return BatcherCycleResult.CAPACITY_CHANGED;
@@ -1102,8 +1072,7 @@ public final class WorkerBatcher {
             ScheduledRequest blockedItem,
             CapacityBoundary blockedResult) {
         BatcherCycleResult result = BatcherCycleResult.NO_ACTION;
-        RemovedTerminalBoundary removedBoundary =
-                RemovedTerminalBoundary.NONE;
+        boolean removedTerminalBoundary = false;
         queueLock.lock();
         try {
             if (stopped) {
@@ -1114,9 +1083,9 @@ public final class WorkerBatcher {
                 result = resolveEmptyCapacityUnderLock(
                         blockedItem, blockedResult, nowMs);
             } else {
-                removedBoundary = removeSelectionBoundaryUnderLock(
+                removedTerminalBoundary = removeSelectionBoundaryUnderLock(
                         blockedItem, blockedResult, nowMs);
-                if (removedBoundary.wasRemoved()) {
+                if (removedTerminalBoundary) {
                     queueVersion.incrementAndGet();
                     result = BatcherCycleResult.CAPACITY_CHANGED;
                 }
@@ -1124,7 +1093,8 @@ public final class WorkerBatcher {
         } finally {
             queueLock.unlock();
         }
-        notifyTerminalAdmissionFailure(removedBoundary);
+        notifyTerminalAdmissionFailure(
+                removedTerminalBoundary, blockedItem, blockedResult);
         return result;
     }
 
@@ -1142,41 +1112,29 @@ public final class WorkerBatcher {
     }
 
     /** Caller holds {@link #queueLock}. */
-    private RemovedTerminalBoundary removeSelectionBoundaryUnderLock(
+    private boolean removeSelectionBoundaryUnderLock(
             ScheduledRequest blockedItem,
             CapacityBoundary blockedResult,
             long nowMs) {
         if (blockedItem == null
                 || blockedResult.unavailable()
                 || blockedResult == CapacityBoundary.OWNERSHIP_LOST) {
-            return RemovedTerminalBoundary.NONE;
+            return false;
         }
         if (!containsIdentity(blockedItem)
                 || blockedItem.requestExpired(nowMs)
                 || !removeTerminalActiveUnderLock(blockedItem)) {
-            return RemovedTerminalBoundary.NONE;
+            return false;
         }
-        Throwable failure = blockedResult.status()
-                == CapacityBoundary.Status.FAILED
-                ? blockedResult.cause() : null;
-        return new RemovedTerminalBoundary(blockedItem, failure);
+        return true;
     }
 
     private void notifyTerminalAdmissionFailure(
-            RemovedTerminalBoundary boundary) {
-        if (boundary.failure() != null) {
-            notifyAdmissionFailure(boundary.item(), boundary.failure());
-        }
-    }
-
-    private record RemovedTerminalBoundary(
+            boolean removed,
             ScheduledRequest item,
-            Throwable failure) {
-        private static final RemovedTerminalBoundary NONE =
-                new RemovedTerminalBoundary(null, null);
-
-        boolean wasRemoved() {
-            return item != null;
+            CapacityBoundary boundary) {
+        if (removed && boundary.status() == CapacityBoundary.Status.FAILED) {
+            notifyAdmissionFailure(item, boundary.cause());
         }
     }
 
@@ -1305,8 +1263,24 @@ public final class WorkerBatcher {
         }
 
         // Cheap advisory gates avoid sorting while the worker cannot dispatch.
-        ActiveQueueState observedState = activeQueueState();
-        ScheduledRequest observedHead = observedState.head();
+        ScheduledRequest observedHead;
+        int observedSize;
+        long observedOldestEnqueuedAtMs = Long.MAX_VALUE;
+        long observedQueueVersion;
+        long observedSchedulingInputVersion;
+        queueLock.lock();
+        try {
+            observedHead = queue.peek();
+            observedSize = queue.size();
+            observedQueueVersion = queueVersion.get();
+            observedSchedulingInputVersion = schedulingInputVersion.get();
+            for (ScheduledRequest item : queue) {
+                observedOldestEnqueuedAtMs = Math.min(
+                        observedOldestEnqueuedAtMs, item.enqueuedAtMs());
+            }
+        } finally {
+            queueLock.unlock();
+        }
         if (observedHead == null) {
             return BatcherCycleResult.NO_ACTION;
         }
@@ -1328,15 +1302,15 @@ public final class WorkerBatcher {
         }
 
         boolean fullCandidate =
-                observedState.activeSize() >= batchMaxCount;
+                observedSize >= batchMaxCount;
         if (predictThresholdMs <= 0 && !fullCandidate
                 && !GroupPlanner.windowElapsed(
-                observedState.oldestEnqueuedAtMs(), nowMs, fixedWaitMs)) {
+                observedOldestEnqueuedAtMs, nowMs, fixedWaitMs)) {
             return awaitCollectionWindow(
                     observedHead,
-                    observedState.queueVersion(),
-                    observedState.schedulingInputVersion(),
-                    observedState.oldestEnqueuedAtMs(), fixedWaitMs);
+                    observedQueueVersion,
+                    observedSchedulingInputVersion,
+                    observedOldestEnqueuedAtMs, fixedWaitMs);
         }
 
         long batchKvTokens = capacity.batchKvCapacity();
@@ -1344,8 +1318,8 @@ public final class WorkerBatcher {
                 .fitsKv(batchKvTokens)) {
             return awaitPrefillKvCapacity(
                     observedHead,
-                    observedState.queueVersion(),
-                    observedState.schedulingInputVersion());
+                    observedQueueVersion,
+                    observedSchedulingInputVersion);
         }
 
         // The ordered snapshot is the selection linearization point;
@@ -1435,7 +1409,7 @@ public final class WorkerBatcher {
             long collectionWindowMs) {
         long collectionDeadline = GroupPlanner.collectionDeadlineMs(
                 windowOpenedAtMs, collectionWindowMs);
-        return awaitingSchedulingChange(
+        return BatcherCycleResult.awaitingSchedulingChange(
                 head, queueVersion, schedulingInputVersion,
                 Math.min(collectionDeadline, head.expiresAtMs()));
     }
@@ -1444,7 +1418,7 @@ public final class WorkerBatcher {
             ScheduledRequest head,
             long queueVersion,
             long schedulingInputVersion) {
-        return awaitingSchedulingChange(
+        return BatcherCycleResult.awaitingSchedulingChange(
                 head, queueVersion, schedulingInputVersion,
                 head.expiresAtMs());
     }
