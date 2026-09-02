@@ -33,6 +33,19 @@ py_test (
 )
 
 py_test (
+    name = "deepgemm_masked_executor_v2_cuda_graph_sm120_test",
+    srcs = ["deepgemm_masked_executor_v2_cuda_graph_test.py"],
+    deps = [
+        "//rtp_llm/models_py:modules",
+        "//rtp_llm:config",
+        "//rtp_llm:testlib",
+    ],
+    env = {"GPU_COUNT": "1"},
+    tags = ["RTX_5000_PRO"],
+    exec_properties = {'gpu':'RTX_5000_PRO', 'gpu_count':'1'},
+)
+
+py_test (
     name = "deepgemm_masked_executor_sm100_test",
     srcs = ["deepgemm_masked_executor_test.py",
             "deepgemm_masked_executor_sm100_test.py"],

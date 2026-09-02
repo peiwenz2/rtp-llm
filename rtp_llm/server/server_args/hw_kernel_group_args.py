@@ -1,11 +1,15 @@
 import logging
 from typing import List
 
+from rtp_llm.ops import HWKernelConfig
 from rtp_llm.server.server_args.util import str2bool
 
-_C_INT_MAX = (1 << 31) - 1
-PREFILL_CUDA_GRAPH_MAX_REQUESTS_LIMIT = 64
-PREFILL_CUDA_GRAPH_MAX_CAPTURE_TOKENS = 1 << 20
+PREFILL_CUDA_GRAPH_MAX_REQUESTS_LIMIT = (
+    HWKernelConfig.prefill_cuda_graph_max_requests_limit
+)
+PREFILL_CUDA_GRAPH_MAX_CAPTURE_TOKENS = (
+    HWKernelConfig.prefill_cuda_graph_max_capture_tokens
+)
 
 
 def _bounded_positive_int(value: str, config_name: str, maximum: int) -> int:
@@ -26,10 +30,6 @@ def _bounded_positive_int(value: str, config_name: str, maximum: int) -> int:
             f"{config_name} must not exceed {maximum}, got {parsed}"
         )
     return parsed
-
-
-def _positive_int(value: str) -> int:
-    return _bounded_positive_int(value, "value", _C_INT_MAX)
 
 
 def _prefill_cuda_graph_max_requests(value: str) -> int:

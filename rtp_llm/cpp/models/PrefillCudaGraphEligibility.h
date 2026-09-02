@@ -1,5 +1,6 @@
 #pragma once
 
+#include "rtp_llm/cpp/cache/CacheGroupType.h"
 #include "rtp_llm/cpp/models/ModelTypes.h"
 #include <algorithm>
 #include <cstdint>
@@ -12,6 +13,15 @@ inline bool isSingleDevicePrefillCudaGraphConfig(const ParallelismConfig& config
            && config.pp_size == 1 && config.ffn_sp_size == 1 && config.ffn_tp_size == 1 && !config.enable_sp
            && !config.prefill_cp_config.is_enabled() && !config.prefill_cp_config.is_prefill_enabled()
            && !config.ffn_disaggregate_config.enable_ffn_disaggregate;
+}
+
+// The first prefill CUDA Graph implementation uses one fully materialized
+// sentinel block table. Sparse LINEAR/SWA groups can contain null entries for
+// inactive slots, so replaying a padded token into them is not safe. Keep the
+// initial contract deliberately narrow until each sparse topology has its own
+// fixed-address scratch representation.
+inline bool supportsPrefillCudaGraphCacheTopology(const std::vector<CacheGroupType>& group_types) {
+    return group_types.size() == 1 && group_types.front() == CacheGroupType::FULL;
 }
 
 inline std::vector<int> defaultPrefillCudaGraphCaptureSeqLens(int64_t max_seq_len) {

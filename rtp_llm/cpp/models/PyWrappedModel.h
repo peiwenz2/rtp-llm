@@ -491,6 +491,13 @@ inline PyWrappedModel::PyWrappedModel(const GptModelInitParams& params,
                 prefill_cuda_graph_init_status_ = PrefillCudaGraphStatus::SCRATCH_KV_UNAVAILABLE;
                 RTP_LLM_LOG_WARNING("prefill CUDA graph disabled reason=scratch_kv_unavailable");
                 enable_prefill_cuda_graph_ = false;
+            } else if (!supportsPrefillCudaGraphCacheTopology(
+                           params.cache_manager->cacheConfig().groupTypesSnapshot())) {
+                prefill_cuda_graph_init_status_ = PrefillCudaGraphStatus::MODEL_NOT_SUPPORTED;
+                RTP_LLM_LOG_WARNING(
+                    "prefill CUDA graph disabled reason=unsupported_cache_topology; the first version requires "
+                    "exactly one FULL cache group");
+                enable_prefill_cuda_graph_ = false;
             } else {
                 std::vector<std::vector<int>> scratch_kernel_block_ids;
                 if (!allocatePrefillCudaGraphScratch(params,

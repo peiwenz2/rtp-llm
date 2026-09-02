@@ -34,8 +34,8 @@ class DeepGemmMaskedExecutorV2CudaGraphTest(unittest.TestCase):
     def setUp(self) -> None:
         if not torch.cuda.is_available() or not has_deep_gemm():
             self.skipTest("DeepGEMM CUDA support is required")
-        if torch.cuda.get_device_capability()[0] != 9:
-            self.skipTest("masked DeepGEMM CUDA graph test requires SM90")
+        if torch.cuda.get_device_capability()[0] not in (9, 12):
+            self.skipTest("masked DeepGEMM CUDA graph test requires SM90 or SM12x")
         torch.manual_seed(20260820)
         torch.cuda.manual_seed(20260820)
         self.config = self._make_config()

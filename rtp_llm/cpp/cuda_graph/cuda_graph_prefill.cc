@@ -141,8 +141,13 @@ void CudaGraphRunner::capturePrefill() {
         }
         capturePrefillOneSeqLen(seq_len);
         cuda_graph::finish_capture_session();
-        capture_session_may_be_dirty_.store(false, std::memory_order_release);
         replayAndSyncCheck(seq_len, "seq len");
+        // A captured graph is not safe to destroy until its first launch has
+        // completed. Keep the dirty guard armed across replay/synchronization;
+        // the factory will fail closed and retain graph-owned storage if this
+        // phase throws. A numerical self-check failure happens after the stream
+        // is drained and remains recoverable.
+        capture_session_may_be_dirty_.store(false, std::memory_order_release);
         if (isGenerativePrefillCudaGraph()) {
             const auto& graph_output = graph_instances_[seq_len].mem_hold_.decoder_layer_hidden_states_;
             RTP_LLM_CHECK_WITH_INFO(torch::allclose(graph_output, eager_selfcheck_output, 1e-3, 1e-3),

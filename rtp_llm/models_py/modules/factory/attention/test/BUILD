@@ -10,3 +10,13 @@ py_test(
         "//rtp_llm/models_py/standalone:py_standalone_testlib",
     ],
 )
+
+py_test(
+    name = "attn_factory_prefill_cuda_graph_test_rocm",
+    srcs = ["attn_factory_prefill_cuda_graph_test.py"],
+    tags = ["rocm"],
+    exec_properties = {"gpu": "MI308X-ROCM7"},
+    deps = [
+        "//rtp_llm/models_py/standalone:py_standalone_testlib",
+    ],
+)

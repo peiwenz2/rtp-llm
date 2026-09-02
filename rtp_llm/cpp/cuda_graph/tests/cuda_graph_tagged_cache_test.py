@@ -149,6 +149,17 @@ def _build_common_inputs(
     return inputs
 
 
+def _with_mrope_positions(inputs: PyModelInputs) -> PyModelInputs:
+    token_count = inputs.input_ids.numel()
+    inputs.combo_position_ids = (
+        torch.arange(token_count, dtype=torch.int32, device="cuda")
+        .unsqueeze(1)
+        .expand(-1, 3)
+        .contiguous()
+    )
+    return inputs
+
+
 def _build_decode_inputs(
     tags: list[str],
     values: dict[str, int],
@@ -367,25 +378,20 @@ class TestCudaGraphTaggedCache(unittest.TestCase):
             CudaGraphSelectionMode.PREFILL_GRAPH,
         )
 
-        # Selection may defer position validation during PREPARE, while the
-        # real forward check must still reject a request that never supplies
-        # the required mRoPE positions.
+        # PREPARE and FORWARD use the same position-id contract. Reject before
+        # prepareAttentionInputs can attempt to copy a missing mRoPE tensor.
         missing_positions = _build_prefill_inputs(
             GROUP_TAGS, {"full": 1, "aux": 2}, seq_len=[2, 2]
         )
-        self.assertTrue(runner.canPrepare(missing_positions))
+        self.assertFalse(runner.canPrepare(missing_positions))
+        self.assertFalse(runner.prepare(missing_positions))
         self.assertFalse(runner.canRun(missing_positions))
 
         # Exercise the smaller exact bucket first.
         inputs = _build_prefill_inputs(
             GROUP_TAGS, {"full": 1, "aux": 2}, seq_len=[2, 2]
         )
-        inputs.combo_position_ids = (
-            torch.arange(4, dtype=torch.int32, device="cuda")
-            .unsqueeze(1)
-            .expand(-1, 3)
-            .contiguous()
-        )
+        _with_mrope_positions(inputs)
         self.assertTrue(runner.canRun(inputs))
         self.assertEqual(runner.getCurrentRealGraphSize(), 4)
         # Exercise the production split prepare -> forward path. This used to
@@ -410,12 +416,7 @@ class TestCudaGraphTaggedCache(unittest.TestCase):
         larger_inputs = _build_prefill_inputs(
             GROUP_TAGS, {"full": 3, "aux": 4}, seq_len=[3, 3]
         )
-        larger_inputs.combo_position_ids = (
-            torch.arange(6, dtype=torch.int32, device="cuda")
-            .unsqueeze(1)
-            .expand(-1, 3)
-            .contiguous()
-        )
+        _with_mrope_positions(larger_inputs)
         self.assertTrue(runner.canRun(larger_inputs))
         self.assertEqual(runner.getCurrentRealGraphSize(), TOKENS_PER_BLOCK)
         larger_output = runner.forward(larger_inputs)
@@ -433,6 +434,7 @@ class TestCudaGraphTaggedCache(unittest.TestCase):
         prefixed = _build_prefill_inputs(
             GROUP_TAGS, {"full": 1, "aux": 2}, seq_len=[2, 2]
         )
+        _with_mrope_positions(prefixed)
 
         # Generative prefill starts from token IDs and must not allocate the
         # decode/MTP-only input_hiddens scratch buffer.
@@ -441,6 +443,7 @@ class TestCudaGraphTaggedCache(unittest.TestCase):
         multimodal_inputs = _build_prefill_inputs(
             GROUP_TAGS, {"full": 1, "aux": 2}, seq_len=[2, 2]
         )
+        _with_mrope_positions(multimodal_inputs)
         multimodal_inputs.multimodal_inputs.multimodal_features = [
             torch.ones((1, HIDDEN_SIZE), dtype=torch.bfloat16, device="cuda")
         ]
@@ -455,20 +458,20 @@ class TestCudaGraphTaggedCache(unittest.TestCase):
         prefixed.attention_inputs["full"].prefix_lengths[0] = 1
         prefixed.attention_inputs["aux"].prefix_lengths[0] = 1
         self.assertFalse(runner.canRun(prefixed))
-        self.assertFalse(
-            runner.canRun(
-                _build_prefill_inputs(
-                    GROUP_TAGS, {"full": 1, "aux": 2}, seq_len=[1, 1, 1]
-                )
+        too_many_requests = _with_mrope_positions(
+            _build_prefill_inputs(GROUP_TAGS, {"full": 1, "aux": 2}, seq_len=[1, 1, 1])
+        )
+        self.assertFalse(runner.canRun(too_many_requests))
+        self.assertEqual(
+            runner.getPrefillStatus(), "request_count_exceed_capture_limit"
+        )
+        too_many_tokens = _with_mrope_positions(
+            _build_prefill_inputs(
+                GROUP_TAGS, {"full": 1, "aux": 2}, seq_len=TOKENS_PER_BLOCK + 1
             )
         )
-        self.assertFalse(
-            runner.canRun(
-                _build_prefill_inputs(
-                    GROUP_TAGS, {"full": 1, "aux": 2}, seq_len=TOKENS_PER_BLOCK + 1
-                )
-            )
-        )
+        self.assertFalse(runner.canRun(too_many_tokens))
+        self.assertEqual(runner.getPrefillStatus(), "input_tokens_exceed_capture_limit")
 
     def test_generative_prefill_without_combo_position_ids(self) -> None:
         runner = CudaGraphRunner()

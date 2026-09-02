@@ -602,6 +602,8 @@ class GrpcConfig:
     def to_string(self) -> str:
         ...
 class HWKernelConfig:
+    prefill_cuda_graph_max_requests_limit: int
+    prefill_cuda_graph_max_capture_tokens: int
     arm_gemm_use_kai: bool
     decode_capture_batch_sizes: list[int]
     deep_gemm_num_sm: int

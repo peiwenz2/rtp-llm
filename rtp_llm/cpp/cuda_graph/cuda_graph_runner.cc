@@ -974,20 +974,22 @@ bool CudaGraphRunner::canReplaySelectedGraph(const PyModelInputs&  inputs,
 
     size_t      copy_numel            = 0;
     const auto& captured_position_ids = graph_it->second.mem_hold_.py_model_inputs_.combo_position_ids;
-    if (mode == CudaGraphCheckMode::FORWARD
-        && !validateComboPositionIds(inputs, state, captured_position_ids, copy_numel)) {
-        const FallbackTick tick = tickFallback(combo_position_fallback_count_);
-        // Log the first fallback and then at powers of two. This keeps the
-        // decode hot path quiet while retaining a monotonic, observable count.
-        if (tick.should_log) {
-            RTP_LLM_LOG_WARNING(
-                "combo_position_ids are incompatible with CUDA graph key %d: factor=%d, src_numel=%lld, "
-                "dst_numel=%lld; fallback to normal run (fallback_count=%llu)",
-                graph_key,
-                position_id_len_factor_,
-                inputs.combo_position_ids.defined() ? static_cast<long long>(inputs.combo_position_ids.numel()) : -1LL,
-                captured_position_ids.defined() ? static_cast<long long>(captured_position_ids.numel()) : -1LL,
-                static_cast<unsigned long long>(tick.count));
+    if (!validateComboPositionIds(inputs, state, captured_position_ids, copy_numel)) {
+        if (observe_fallback) {
+            const FallbackTick tick = tickFallback(combo_position_fallback_count_);
+            // Log the first fallback and then at powers of two. This keeps the
+            // decode hot path quiet while retaining a monotonic, observable count.
+            if (tick.should_log) {
+                RTP_LLM_LOG_WARNING(
+                    "combo_position_ids are incompatible with CUDA graph key %d: factor=%d, src_numel=%lld, "
+                    "dst_numel=%lld; fallback to normal run (fallback_count=%llu)",
+                    graph_key,
+                    position_id_len_factor_,
+                    inputs.combo_position_ids.defined() ? static_cast<long long>(inputs.combo_position_ids.numel()) :
+                                                          -1LL,
+                    captured_position_ids.defined() ? static_cast<long long>(captured_position_ids.numel()) : -1LL,
+                    static_cast<unsigned long long>(tick.count));
+            }
         }
         return false;
     }
@@ -1068,8 +1070,12 @@ bool CudaGraphRunner::canRun(const PyModelInputs& inputs, CudaGraphState& state,
         int64_t     length_sum      = 0;
         const auto* input_lengths   = inputs.attention_inputs.input_lengths.data_ptr<int32_t>();
         for (int i = 0; i < real_requests; ++i) {
-            if (input_lengths[i] <= 0 || input_lengths[i] > max_seq_len_) {
+            if (input_lengths[i] <= 0) {
                 return fallback("metadata_mismatch", PrefillCudaGraphStatus::INPUT_METADATA_INVALID);
+            }
+            if (input_lengths[i] > max_seq_len_) {
+                return fallback("input_tokens_exceed_capture_limit",
+                                PrefillCudaGraphStatus::INPUT_TOKENS_EXCEED_CAPTURE_LIMIT);
             }
             length_sum += input_lengths[i];
         }

@@ -346,12 +346,14 @@ class ServerArgsSetTest(TestCase):
             [7, 19, 31],
         )
 
-        with self.assertRaises(ArgumentTypeError):
-            hw_kernel_group_args._positive_int("0")
-        with self.assertRaises(ArgumentTypeError):
-            hw_kernel_group_args._positive_int("not-an-integer")
-        with self.assertRaisesRegex(ArgumentTypeError, "must not exceed"):
-            hw_kernel_group_args._positive_int(str(1 << 31))
+        self.assertEqual(
+            hw_kernel_group_args.PREFILL_CUDA_GRAPH_MAX_REQUESTS_LIMIT,
+            HWKernelConfig.prefill_cuda_graph_max_requests_limit,
+        )
+        self.assertEqual(
+            hw_kernel_group_args.PREFILL_CUDA_GRAPH_MAX_CAPTURE_TOKENS,
+            HWKernelConfig.prefill_cuda_graph_max_capture_tokens,
+        )
         with self.assertRaisesRegex(ArgumentTypeError, "must not exceed 64"):
             hw_kernel_group_args._prefill_cuda_graph_max_requests("65")
         with self.assertRaisesRegex(ArgumentTypeError, "maximum is 64"):

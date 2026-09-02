@@ -160,6 +160,15 @@ TEST_F(ModelDataTest, testPrefillCudaGraphSupportsDenseModel) {
     EXPECT_TRUE(supportsPrefillCudaGraphMoe(description, ParallelismConfig{}, MoeConfig{}));
 }
 
+TEST_F(ModelDataTest, testPrefillCudaGraphRequiresSingleFullCacheGroup) {
+    EXPECT_TRUE(supportsPrefillCudaGraphCacheTopology({CacheGroupType::FULL}));
+    EXPECT_FALSE(supportsPrefillCudaGraphCacheTopology({}));
+    EXPECT_FALSE(supportsPrefillCudaGraphCacheTopology({CacheGroupType::LINEAR}));
+    EXPECT_FALSE(supportsPrefillCudaGraphCacheTopology({CacheGroupType::SWA}));
+    EXPECT_FALSE(supportsPrefillCudaGraphCacheTopology({CacheGroupType::FULL, CacheGroupType::LINEAR}));
+    EXPECT_FALSE(supportsPrefillCudaGraphCacheTopology({CacheGroupType::FULL, CacheGroupType::SWA}));
+}
+
 TEST_F(ModelDataTest, testDefaultPrefillCudaGraphBucketsAreClippedToModelLimit) {
     EXPECT_TRUE(defaultPrefillCudaGraphCaptureSeqLens(0).empty());
     EXPECT_EQ(defaultPrefillCudaGraphCaptureSeqLens(4), (std::vector<int>{1, 2, 3, 4}));

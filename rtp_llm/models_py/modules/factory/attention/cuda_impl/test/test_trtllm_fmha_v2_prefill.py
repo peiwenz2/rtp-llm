@@ -201,15 +201,14 @@ class TestTRTLLMFMHAv2PrefillOpBF16(TRTLLMFMHAv2TestBase):
 
     def test_cuda_graph(self):
         test_cases = [
-            ("aligned", [48, 32], [40, 40]),
-            ("compact", [32, 24], [24, 32]),
-            ("replay_smaller_batch", [32, 8, 8, 8], [24, 32, 0, 0]),
-            ("capture_empty_batch", [56, 0, 0, 0], [24, 32, 0, 0]),
+            ("packed_qkv", 8, [48, 32], [40, 40]),
+            ("contiguous_q_kv", 2, [32, 24], [24, 32]),
+            ("replay_smaller_batch", 2, [32, 8, 8, 8], [24, 32, 0, 0]),
+            ("capture_empty_batch", 2, [56, 0, 0, 0], [24, 32, 0, 0]),
         ]
-        for layout, capture_lengths, replay_lengths in test_cases:
+        for layout, head_num_kv, capture_lengths, replay_lengths in test_cases:
             with self.subTest(layout=layout):
                 head_num = 8
-                head_num_kv = 2
                 head_dim = 128
                 tokens_per_block = 64
 
@@ -420,6 +419,9 @@ class TestTRTLLMFMHAv2PrefillOpBF16(TRTLLMFMHAv2TestBase):
                         rtol=5e-3,
                         atol=5e-3,
                     )
+                # Empty request rows are encoded with block id 0. They must
+                # never publish sentinel KV into the allocator's null block.
+                self.assertEqual(graph_cache.kv_cache_base[0].count_nonzero().item(), 0)
                 self.assertEqual(graph_cache.kv_cache_base[5].count_nonzero().item(), 0)
                 scratch_nonzero = (
                     graph_cache.kv_cache_base[scratch_block_id].count_nonzero().item()

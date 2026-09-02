@@ -327,6 +327,37 @@ TEST_F(KVCacheManagerTest, WarmupConfigSmoke) {
     EXPECT_EQ(cache_manager->freeBlocksNum(), 0);
 }
 
+TEST_F(KVCacheManagerTest, PermanentReservationReducesAdmissionCapacity) {
+    auto cache_config = makeSimpleMhaCacheConfig(
+        /*layer_num=*/1, /*block_num=*/10, /*tokens_per_block=*/4, rtp_llm::DataType::TYPE_INT8);
+    auto cache_manager = std::make_shared<KVCacheManager>(cache_config, /*warmup=*/false);
+    ASSERT_TRUE(cache_manager->init());
+
+    constexpr int64_t kReservationId      = -1001;
+    constexpr size_t  kReservedTokenCount = 8;
+    const size_t      original_capacity   = cache_manager->maxAvailableTokensNum();
+    ASSERT_GT(original_capacity, kReservedTokenCount);
+    ASSERT_TRUE(cache_manager->registerPermanentTokenReservation(kReservationId, kReservedTokenCount));
+    EXPECT_EQ(cache_manager->permanentReservedTokensNum(), kReservedTokenCount);
+    EXPECT_EQ(cache_manager->maxAvailableTokensNum(), original_capacity - kReservedTokenCount);
+    EXPECT_FALSE(cache_manager->registerPermanentTokenReservation(kReservationId, 1));
+
+    const int  rejected_seq_len = static_cast<int>(cache_manager->maxAvailableTokensNum() + 1);
+    auto       resource         = makeDSV4BatchResource(cache_config);
+    auto       token_ids = makeDSV4CompleteTokenIds(rejected_seq_len, rejected_seq_len, /*seq_size_per_block=*/4);
+    MallocInfo malloc_info{resource, token_ids};
+    malloc_info.verbose             = false;
+    malloc_info.reuse_cache         = false;
+    malloc_info.enable_device_cache = false;
+    const auto result               = cache_manager->malloc(malloc_info);
+    EXPECT_FALSE(result.success);
+    EXPECT_EQ(result.status, MallocStatus::PERMANENT_RESOURCE_EXHAUSTED);
+
+    cache_manager->releasePermanentTokenReservation(kReservationId);
+    EXPECT_EQ(cache_manager->permanentReservedTokensNum(), 0u);
+    EXPECT_EQ(cache_manager->maxAvailableTokensNum(), original_capacity);
+}
+
 TEST_F(KVCacheManagerTest, InitRejectsSingleLinearGroup) {
     auto cache_config = makeSimpleLinearCacheConfig(
         /*layer_num=*/2, /*block_num=*/4, /*tokens_per_block=*/2, rtp_llm::DataType::TYPE_BF16);

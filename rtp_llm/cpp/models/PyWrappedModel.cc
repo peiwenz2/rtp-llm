@@ -179,6 +179,20 @@ bool PyWrappedModel::allocatePrefillCudaGraphScratch(const GptModelInitParams&  
             return false;
         }
     }
+    // blocksNum() is the logical allocator footprint. kernelBlocks() may
+    // expand one logical block into multiple attention-kernel rows when the
+    // two block sizes differ, so using the exported table length here would
+    // overcharge admission capacity.
+    const size_t scratch_token_capacity = resource->blocksNum(0, 0) * cache_config.seqSizePerBlockForGroup(0);
+    if (!cache_manager_->registerPermanentTokenReservation(prefill_cuda_graph_scratch_request_id_,
+                                                           scratch_token_capacity)) {
+        cache_manager_->free(FreeInfo{resource, token_ids, prefill_cuda_graph_scratch_request_id_});
+        scratch_kernel_block_ids.clear();
+        RTP_LLM_LOG_WARNING(
+            "prefill CUDA graph fallback reason=scratch_kv_unavailable permanent reservation failed tokens=%zu",
+            scratch_token_capacity);
+        return false;
+    }
     prefill_cuda_graph_scratch_resource_  = std::move(resource);
     prefill_cuda_graph_scratch_token_ids_ = std::move(token_ids);
     RTP_LLM_LOG_INFO("prefill CUDA graph reserved sentinel scratch: bucket=%d groups=%zu",
@@ -194,6 +208,7 @@ void PyWrappedModel::releasePrefillCudaGraphScratch() {
     cache_manager_->free(FreeInfo{prefill_cuda_graph_scratch_resource_,
                                   prefill_cuda_graph_scratch_token_ids_,
                                   prefill_cuda_graph_scratch_request_id_});
+    cache_manager_->releasePermanentTokenReservation(prefill_cuda_graph_scratch_request_id_);
     prefill_cuda_graph_scratch_resource_.reset();
     prefill_cuda_graph_scratch_token_ids_.reset();
     RTP_LLM_LOG_INFO("prefill CUDA graph sentinel scratch released");
@@ -840,7 +855,7 @@ void PyWrappedModel::updateKVCacheKernelBlockId(const GptModelInputs& inputs) {
         auto  empty           = torch::Tensor();
         auto  py_model_inputs = PyModelInputs({empty,
                                                empty,
-                                               empty,
+                                               attention_inputs_.combo_position_ids,
                                                torch_ext::PyEmbeddingInputs(),
                                                torch_ext::PyMultimodalInputs(),
                                                attention_inputs_,

@@ -291,8 +291,22 @@ MallocResult KVCacheManager::malloc(const MallocInfo& malloc_info) {
     RTP_LLM_CHECK_WITH_INFO(allocator_ != nullptr, "KVCacheManager::malloc called before KVCacheManager::init");
     RTP_LLM_CHECK(malloc_info.batch_kv_cache_resource && malloc_info.complete_token_ids);
 
-    const int  seq_size_per_block = config_.seq_size_per_block;
-    const bool is_first_malloc    = !malloc_info.batch_kv_cache_resource->curBlocksNum();
+    const int  seq_size_per_block          = config_.seq_size_per_block;
+    const bool is_first_malloc             = !malloc_info.batch_kv_cache_resource->curBlocksNum();
+    const auto permanently_reserved_tokens = permanentReservedTokensNum();
+    const auto max_available_tokens        = maxAvailableTokensNum();
+    if (is_first_malloc && permanently_reserved_tokens > 0
+        && static_cast<size_t>(std::max(malloc_info.complete_token_ids->seqLength(), 0)) > max_available_tokens) {
+        if (malloc_info.verbose) {
+            RTP_LLM_LOG_WARNING("KVCacheManager rejected request beyond permanent capacity: request_id=%ld seq_len=%d "
+                                "max_available_tokens=%zu permanently_reserved_tokens=%zu",
+                                malloc_info.request_id,
+                                malloc_info.complete_token_ids->seqLength(),
+                                max_available_tokens,
+                                permanently_reserved_tokens);
+        }
+        return {false, 0, 0, MallocStatus::PERMANENT_RESOURCE_EXHAUSTED};
+    }
     // A first malloc that failed with MallocStatus::RETRYABLE_RESOURCE_EXHAUSTED leaves the stream
     // WAITING and re-enters here having allocated nothing, so curBlocksNum() is still zero and
     // is_first_malloc is still true. Recomputing the keys is wasted work, and reporting the
@@ -523,7 +537,41 @@ size_t KVCacheManager::totalBlocksNum() const {
 }
 
 size_t KVCacheManager::maxAvailableTokensNum() const {
-    return allocator_->maxAvailableTokensNum();
+    const size_t                total_tokens = allocator_->maxAvailableTokensNum();
+    std::lock_guard<std::mutex> lock(permanent_token_reservations_mutex_);
+    return total_tokens > permanent_reserved_tokens_ ? total_tokens - permanent_reserved_tokens_ : 0;
+}
+
+bool KVCacheManager::registerPermanentTokenReservation(int64_t reservation_id, size_t token_count) {
+    RTP_LLM_CHECK_WITH_INFO(allocator_ != nullptr,
+                            "registerPermanentTokenReservation called before KVCacheManager initialized");
+    if (token_count == 0) {
+        return false;
+    }
+    const size_t                total_tokens = allocator_->maxAvailableTokensNum();
+    std::lock_guard<std::mutex> lock(permanent_token_reservations_mutex_);
+    if (permanent_token_reservations_.find(reservation_id) != permanent_token_reservations_.end()
+        || permanent_reserved_tokens_ > total_tokens || token_count > total_tokens - permanent_reserved_tokens_) {
+        return false;
+    }
+    permanent_token_reservations_.emplace(reservation_id, token_count);
+    permanent_reserved_tokens_ += token_count;
+    return true;
+}
+
+void KVCacheManager::releasePermanentTokenReservation(int64_t reservation_id) {
+    std::lock_guard<std::mutex> lock(permanent_token_reservations_mutex_);
+    const auto                  it = permanent_token_reservations_.find(reservation_id);
+    if (it == permanent_token_reservations_.end()) {
+        return;
+    }
+    permanent_reserved_tokens_ -= it->second;
+    permanent_token_reservations_.erase(it);
+}
+
+size_t KVCacheManager::permanentReservedTokensNum() const {
+    std::lock_guard<std::mutex> lock(permanent_token_reservations_mutex_);
+    return permanent_reserved_tokens_;
 }
 
 KVCacheInfo KVCacheManager::getKVCacheInfo(int64_t latest_version, bool need_cache_keys) const {

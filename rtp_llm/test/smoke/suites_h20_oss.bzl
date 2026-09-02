@@ -212,7 +212,7 @@ def h20_oss_suites():
                 task_info="data/model/qwen25/q_r_prefill_cuda_graph.json",
                 smoke_args="--act_type BF16 --warm_up 0 --seq_size_per_block 64 --test_block_num 1000 --concurrency_limit 5 --enable_cuda_graph 1 --decode_capture_config '1' --enable_prefill_cuda_graph 1 --prefill_cuda_graph_max_requests 5 --prefill_cuda_graph_capture_config '64,256'",
                 gpu_type=["H20"],
-                concurrency_test=True,
+                parallel_qr=2,
             ),
             smoke_test(
                 name="dense_fp8kv_cudagraph",

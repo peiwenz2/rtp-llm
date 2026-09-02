@@ -740,6 +740,10 @@ PYBIND11_MODULE(libth_transformer_config, m) {
     // Register HWKernelConfig
     py::class_<HWKernelConfig>(m, "HWKernelConfig")
         .def(py::init<>())
+        .def_property_readonly_static("prefill_cuda_graph_max_requests_limit",
+                                      [](py::object) { return HWKernelConfig::kPrefillCudaGraphMaxRequestsLimit; })
+        .def_property_readonly_static("prefill_cuda_graph_max_capture_tokens",
+                                      [](py::object) { return HWKernelConfig::kPrefillCudaGraphMaxCaptureTokens; })
         .def_readwrite("deep_gemm_num_sm", &HWKernelConfig::deep_gemm_num_sm)
         .def_readwrite("arm_gemm_use_kai", &HWKernelConfig::arm_gemm_use_kai)
         .def_readwrite("enable_multi_block_mode", &HWKernelConfig::enable_multi_block_mode)
