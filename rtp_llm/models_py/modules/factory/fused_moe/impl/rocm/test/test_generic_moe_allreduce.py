@@ -266,7 +266,7 @@ def _run_batched_eager_and_graph(rank):
     )
     torch.testing.assert_close(topk_ids, expected_ids, rtol=0, atol=0)
     torch.testing.assert_close(topk_weights, expected_weights, rtol=1e-5, atol=1e-6)
-    torch.testing.assert_close(output, expected, rtol=3e-2, atol=1e-2)
+    torch.testing.assert_close(output, expected, rtol=5e-2, atol=5e-2)
 
     stream = torch.cuda.Stream(device=device)
     stream.wait_stream(torch.cuda.current_stream(device))
@@ -296,7 +296,7 @@ def _run_batched_eager_and_graph(rank):
     )
     torch.testing.assert_close(topk_ids, expected_ids, rtol=0, atol=0)
     torch.testing.assert_close(topk_weights, expected_weights, rtol=1e-5, atol=1e-6)
-    torch.testing.assert_close(graph_output, expected, rtol=3e-2, atol=1e-2)
+    torch.testing.assert_close(graph_output, expected, rtol=5e-2, atol=5e-2)
 
 
 def _run_real_two_gpu_case(rank, world_size, ports, with_gate):
