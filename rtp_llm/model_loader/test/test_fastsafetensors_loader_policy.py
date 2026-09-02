@@ -697,7 +697,6 @@ class TestMoeAtomicWeightTensorNames(unittest.TestCase):
         load_config = self._load_config(database)
         load_config.compute_dtype = torch.float32
         load_config.merge_lora = False
-        load_config.moe_pure_tp_preshard = False
         load_config.tp_size = 1
         load_config.dp_size = 1
         load_config.ep_size = 1

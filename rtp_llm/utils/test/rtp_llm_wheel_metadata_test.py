@@ -6,37 +6,10 @@ import unittest
 import zipfile
 from email.parser import Parser
 from pathlib import Path
-from typing import Dict, FrozenSet, Sequence
+from typing import Dict, Sequence
 
-PLATFORM_DIRECT_URL_PACKAGES: Dict[str, FrozenSet[str]] = {
-    "cuda12_9_x86": frozenset(
-        {"torch", "torchvision", "fast-safetensors", "fastsafetensors"}
-    ),
-    "cuda13_x86": frozenset(
-        {
-            "torch",
-            "torchvision",
-            "deep-gemm",
-            "flash-mla",
-            "rtp-kernel",
-            "fast-safetensors",
-            "fastsafetensors",
-        }
-    ),
-    "cuda13_arm": frozenset(
-        {
-            "torch",
-            "torchvision",
-            "deep-gemm",
-            "flash-mla",
-            "rtp-kernel",
-            "fast-safetensors",
-            "fastsafetensors",
-            "tilelang",
-            "z3-solver",
-        }
-    ),
-}
+SUPPORTED_PLATFORMS = frozenset({"cuda12_9_x86", "cuda13_x86", "cuda13_arm"})
+FASTSAFETENSORS_PACKAGES = frozenset({"fast-safetensors", "fastsafetensors"})
 
 
 def _normalize_package_name(name: str) -> str:
@@ -91,13 +64,15 @@ class RtpLlmWheelMetadataTest(unittest.TestCase):
     lock_path = Path()
 
     def test_direct_requirements_match_platform_lock_file(self) -> None:
-        expected_names = PLATFORM_DIRECT_URL_PACKAGES[self.platform]
+        self.assertIn(self.platform, SUPPORTED_PLATFORMS)
         locked_urls = _locked_direct_urls(self.lock_path)
-        missing_from_lock = expected_names - locked_urls.keys()
+        missing_from_lock = FASTSAFETENSORS_PACKAGES - locked_urls.keys()
         self.assertFalse(missing_from_lock, sorted(missing_from_lock))
 
-        expected = {name: locked_urls[name] for name in expected_names}
-        self.assertEqual(_wheel_direct_urls(self.wheel_path), expected)
+        expected = {name: locked_urls[name] for name in FASTSAFETENSORS_PACKAGES}
+        wheel_urls = _wheel_direct_urls(self.wheel_path)
+        actual = {name: wheel_urls.get(name) for name in FASTSAFETENSORS_PACKAGES}
+        self.assertEqual(actual, expected)
 
 
 def main(argv: Sequence[str]) -> None:

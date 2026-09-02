@@ -60,22 +60,15 @@ class ModelLoader:
         database: BaseDatabase,
         load_method: LoadMethod = LoadMethod.AUTO,
         force_cpu_load_weights: bool = False,
-        moe_pure_tp_preshard: bool = False,
     ):
         self.model_config = model_config
         self._task_type = model_config.task_type
         self._load_method = load_method
         self._weights_info = weights_info
         self._misc_weights_info: Optional[CustomAtomicWeight] = misc_weights_info
-        if self._misc_weights_info is None:
-            self._misc_weights_info = []
         self._model_weights_info: Optional[ModelWeightInfo] = (
             self._weights_info.create_model_weight_info(database)
         )
-        # Non-owning global tensors supplied by another live model. Descriptors
-        # with these names are excluded before checkpoint iteration and the
-        # resulting ModelWeights points directly at the owner's tensors.
-        self._global_weight_aliases: Dict[str, torch.Tensor] = {}
 
         # Get compute_dtype from model_config
         compute_dtype = model_config.compute_dtype
@@ -92,7 +85,6 @@ class ModelLoader:
             phy2log=self._phy2log,
             exported_device=get_current_device(),
             force_cpu_load_weights=force_cpu_load_weights,
-            moe_pure_tp_preshard=moe_pure_tp_preshard,
         )
 
     def get_load_config(self) -> LoadConfig:
@@ -104,25 +96,7 @@ class ModelLoader:
 
     @timer_wrapper(description="load weights")
     @torch.inference_mode()
-    def load_weights(
-        self,
-        device: str,
-        global_weight_aliases: Optional[Mapping[str, torch.Tensor]] = None,
-    ):
-        self._global_weight_aliases = dict(global_weight_aliases or {})
-        descriptor_names = {weight.name for weight in self._model_weights_info.weights}
-        unknown_aliases = set(self._global_weight_aliases) - descriptor_names
-        if unknown_aliases:
-            raise KeyError(
-                f"global weight aliases are not declared by this model: {sorted(unknown_aliases)}"
-            )
-        for name, tensor in self._global_weight_aliases.items():
-            if not isinstance(tensor, torch.Tensor):
-                raise TypeError(f"global weight alias {name!r} is not a torch.Tensor")
-            if tensor.device != torch.device(device):
-                raise ValueError(
-                    f"global weight alias {name!r} is on {tensor.device}, expected {torch.device(device)}"
-                )
+    def load_weights(self, device: str):
         if self._load_config.is_ft_style_weight:
             weights = self._load_from_ft_style(device)
         else:
@@ -242,7 +216,7 @@ class ModelLoader:
         direct_io = self._load_config.exported_device.support_dio_load
         # 清空现有的权重
         weights = [{} for _ in range(num_layers)]
-        global_weights = dict(self._global_weight_aliases)
+        global_weights = {}
         # 重新构建权重
         all_tensors = self._load_config.database.load_tensors_by_prefix(
             (layer_weight_prefix, global_weight_prefix), device, direct_io=direct_io
@@ -258,8 +232,6 @@ class ModelLoader:
                 weights[layer_id][name] = tensor[0].to(device)
             elif key.startswith(global_weight_prefix):
                 name = key[len(global_weight_prefix) :]
-                if name in self._global_weight_aliases:
-                    continue
                 check_with_info(len(tensor) == 1, f"{name} have {len(tensor)} tensor)")
                 global_weights[name] = tensor[0].to(device)
         model_weights.weights = weights
@@ -817,7 +789,10 @@ class ModelLoader:
         return model_weights
 
     def prepare_weights(self, device: str):
-        if not self._is_attn_model:
+        if (
+            self._load_config.vit_separation != VitSeparation.VIT_SEPARATION_ROLE
+            and not self._is_attn_model
+        ):
             for id in range(self._load_config.num_layers):
                 results = self._load_layer_weights(id, device)
                 for name, tensor in results.items():
@@ -850,7 +825,7 @@ class ModelLoader:
         WeightInfo = ModelLoader.WeightInfo
         tensor_to_weight_map: Dict[str, WeightInfo] = {}
         weight_info_list: List[WeightInfo] = []
-        if self._model_weights_info.layer_weights != []:
+        if self._load_config.vit_separation != VitSeparation.VIT_SEPARATION_ROLE:
             for layer_id in range(self._load_config.num_layers):
                 layer_weights = self._model_weights_info.layer_weights[layer_id]
                 if isinstance(layer_weights, WeightModule):
@@ -897,8 +872,6 @@ class ModelLoader:
         return tensor_to_weight_map, weight_info_list
 
     def _maybe_skip_weight(self, weight: WeightModule):
-        if weight.name in self._global_weight_aliases:
-            return True
         if self._task_type == TaskType.LANGUAGE_MODEL:
             return False
         return weight.name in [W.lm_head]
@@ -976,11 +949,9 @@ class ModelLoader:
         logging.info("Cleaned up database resources to release host memory")
 
     def _create_model_weights(self, device):
-        weights = ModelWeights(
+        return ModelWeights(
             self._load_config.num_layers, device, self._load_config.compute_dtype
         )
-        weights.global_weights.update(self._global_weight_aliases)
-        return weights
 
     def _choose_weight_convert_device(self, current_device):
         if self._load_config.force_cpu_load_weights:
@@ -1014,15 +985,17 @@ class ModelLoader:
         for layer_id, name, tensor in self.prepare_weights(convert_device):
             if convert_device != device:
                 tensor = tensor.to(device)
-            if layer_id is not None:
+            if (
+                layer_id is not None
+                and self._load_config.vit_separation
+                != VitSeparation.VIT_SEPARATION_ROLE
+            ):
                 weights.set_layer_weight(layer_id, name, tensor)
             else:
                 weights.set_global_weight(name, tensor)
         return weights
 
     def _load_layer_weights(self, layer_id: int, device: str):
-        if self._model_weights_info.layer_weights == []:
-            return {}
         assert isinstance(self._model_weights_info.layer_weights[0], list)
         layer_weights = self._model_weights_info.layer_weights[layer_id]
         weights = {}
@@ -1037,8 +1010,6 @@ class ModelLoader:
         return weights
 
     def _load_layer_lora_weights(self, lora_name: str, layer_id: int, device: str):
-        if self._model_weights_info.layer_weights == []:
-            return {}
         assert isinstance(self._model_weights_info.layer_weights[0], list)
         layer_weights = self._model_weights_info.layer_weights[layer_id]
         weights = {}
@@ -1063,42 +1034,43 @@ class ModelLoader:
                 f"embedding_size is {self._weights_info.model_config.embedding_size}, vocab size is {self._weights_info.model_config.vocab_size}"
             )
 
-        if self._task_type == TaskType.LANGUAGE_MODEL:
-            lm_head_w = weight.steal_global_weight(W.lm_head)
-            if lm_head_w == None:
-                lm_head_w = weight.global_weights[W.embedding]
-            if self._weights_info.model_config.normalize_lm_head_weight:
-                lm_head_w = F.normalize(lm_head_w)
-            logit_scale = self._weights_info.model_config.logit_scale
-            if logit_scale != 1.0:
-                lm_head_w = logit_scale * lm_head_w
-            weight.set_global_weight(W.lm_head, lm_head_w)
-        else:
-            # Some LLM can be used for other tasks, e.g. classification, in which case lm_head is not needed
-            weight.steal_global_weight(W.lm_head)
+        if self._load_config.vit_separation != VitSeparation.VIT_SEPARATION_ROLE:
+            if self._task_type == TaskType.LANGUAGE_MODEL:
+                lm_head_w = weight.steal_global_weight(W.lm_head)
+                if lm_head_w == None:
+                    lm_head_w = weight.global_weights[W.embedding]
+                if self._weights_info.model_config.normalize_lm_head_weight:
+                    lm_head_w = F.normalize(lm_head_w)
+                logit_scale = self._weights_info.model_config.logit_scale
+                if logit_scale != 1.0:
+                    lm_head_w = logit_scale * lm_head_w
+                weight.set_global_weight(W.lm_head, lm_head_w)
+            else:
+                # Some LLM can be used for other tasks, e.g. classification, in which case lm_head is not needed
+                weight.steal_global_weight(W.lm_head)
 
-        pos_weight = weight.global_weights.get(W.positional_embedding, None)
-        if pos_weight != None:
-            max_seq_len = self._weights_info.model_config.max_seq_len
-            if pos_weight.shape[0] < max_seq_len:
-                raise Exception(
-                    f"positon_weight has shape: {pos_weight.shape}, but max_seq_len is: {max_seq_len} > {pos_weight.shape[0]}"
-                )
-            pos_weight = pos_weight[:max_seq_len].to(device)
-            weight.set_global_weight(W.positional_embedding, pos_weight)
+            pos_weight = weight.global_weights.get(W.positional_embedding, None)
+            if pos_weight != None:
+                max_seq_len = self._weights_info.model_config.max_seq_len
+                if pos_weight.shape[0] < max_seq_len:
+                    raise Exception(
+                        f"positon_weight has shape: {pos_weight.shape}, but max_seq_len is: {max_seq_len} > {pos_weight.shape[0]}"
+                    )
+                pos_weight = pos_weight[:max_seq_len].to(device)
+                weight.set_global_weight(W.positional_embedding, pos_weight)
 
-        dynamic_weights = self._weights_info.create_dynamic_weights()
-        if dynamic_weights:
-            for dynamic_weight in dynamic_weights:
-                dynamic_w = dynamic_weight.load(
-                    DatabaseTensorSource(self._load_config.database),
-                    None,
-                    device,
-                    self._load_config,
-                )
-                weight.set_global_weight(
-                    dynamic_weight.name, dynamic_w.get(dynamic_weight.name)
-                )
+            dynamic_weights = self._weights_info.create_dynamic_weights()
+            if dynamic_weights:
+                for dynamic_weight in dynamic_weights:
+                    dynamic_w = dynamic_weight.load(
+                        DatabaseTensorSource(self._load_config.database),
+                        None,
+                        device,
+                        self._load_config,
+                    )
+                    weight.set_global_weight(
+                        dynamic_weight.name, dynamic_w.get(dynamic_weight.name)
+                    )
 
     def create_eplb(self):
         weights_info = self._weights_info
@@ -1176,7 +1148,6 @@ def get_model_loader(
     database: BaseDatabase,
     load_method: LoadMethod = LoadMethod.AUTO,
     force_cpu_load_weights: bool = False,
-    moe_pure_tp_preshard: bool = False,
 ) -> ModelLoader:
     if weights_info._head_num % weights_info.tp_size != 0:
         raise Exception(
@@ -1190,5 +1161,4 @@ def get_model_loader(
         database,
         load_method=load_method,
         force_cpu_load_weights=force_cpu_load_weights,
-        moe_pure_tp_preshard=moe_pure_tp_preshard,
     )

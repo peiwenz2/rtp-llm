@@ -6,7 +6,7 @@ This page lists server arguments used to configure the behavior and performance 
 
 | Arguments | Description | Defaults |
 |-----------|-------------|----------|
-| `--worker_info_port_num` | Stride between port **bases** for each `rank_id`: `base = start_port + rank_id * worker_info_port_num`. Offsets under each base include RPC, HTTP, DashSc gRPC (`base + 8`), etc. **Breaking change:** default was **8**, now **9**. Services with DashSc gRPC enabled require this value to be at least `9`; multi-rank deployments that relied on the old stride must re-check ports. See [breaking-changes.md](../release/breaking-changes.md). | 9 |
+| `--worker_info_port_num` | Stride between port **bases** for each `rank_id`: `base = start_port + rank_id * worker_info_port_num`. Offsets under each base include RPC, HTTP, DashSc gRPC (`base + 8`), etc. **Breaking change:** default was **8**, now **9** — multi-rank deployments that relied on the old default must re-check ports or set `8` explicitly. See [breaking-changes.md](../release/breaking-changes.md). | 9 |
 | `--tp-size` | Specifies the tensor parallelism degree. | None |
 | `--ep-size` | Defines the number of model instances for expert parallelism. | None |
 | `--dp-size` | Sets the number of replicas or group size for data parallelism. | None |
@@ -26,26 +26,16 @@ This page lists server arguments used to configure the behavior and performance 
 
 | Arguments | Description | Defaults |
 |-----------|-------------|----------|
-| `--enable_fmha` | Enables Fused Multi-Head Attention (FMHA) feature. | True |
-| `--enable_flashinfer_trtllm_gen` | Enables FlashInfer TRT-LLM Gen attention on SM100. | True |
-| `--enable_flashinfer_trt_fmha_v2` | Enables FlashInfer TRT-LLM FMHA v2 contiguous prefill. | True |
-| `--enable_paged_flashinfer_trt_fmha_v2` | Enables FlashInfer TRT-LLM FMHA v2 paged prefill. | True |
-| `--enable_open_source_fmha` | Enables open-source FMHA implementation. | True |
-| `--enable_paged_open_source_fmha` | Enables Paged open-source FMHA implementation. | True |
-| `--disable_flashinfer_native` | Disables FlashInfer native attention backends. | False |
-| `--disable_flashinfer_hybrid_prefill` | Disables FlashInfer native Hybrid Prefill implementation. | True |
-| `--enable_xqa` | Enables XQA feature (requires SM90+ GPU). | True |
-
-### Removed FMHA options
-
-The following legacy options and environment variables were removed and must no longer be used:
-
-| Removed CLI option | Removed environment variable | Replacement |
-|--------------------|------------------------------|-------------|
-| `--enable_trt_fmha` | `ENABLE_TRT_FMHA` | `--enable_flashinfer_trt_fmha_v2` / `ENABLE_FLASHINFER_TRT_FMHA_V2` for contiguous prefill |
-| `--enable_paged_trt_fmha` | `ENABLE_PAGED_TRT_FMHA` | `--enable_paged_flashinfer_trt_fmha_v2` / `ENABLE_PAGED_FLASHINFER_TRT_FMHA_V2` for paged prefill |
-| `--enable_trtv1_fmha` | `ENABLE_TRTV1_FMHA` | None; select another supported attention backend |
-| `--disable_flash_infer` | `DISABLE_FLASH_INFER` | To preserve global disable behavior, set `--disable_flashinfer_native=true`, `--enable_flashinfer_trtllm_gen=false`, `--enable_flashinfer_trt_fmha_v2=false`, and `--enable_paged_flashinfer_trt_fmha_v2=false` |
+| `--enable-fmha` | Enables Fused Multi-Head Attention (FMHA) feature. | True |
+| `--enable-trt-fmha` | Enables TensorRT optimized FMHA feature. | True |
+| `--enable-paged-trt-fmha` | Enables Paged TensorRT FMHA. | True |
+| `--enable-open-source-fmha` | Enables open-source FMHA implementation. | True |
+| `--enable-paged-open-source-fmha` | Enables Paged open-source FMHA implementation. | True |
+| `--enable-trtv1-fmha` | Enables TRTv1-style FMHA. | True |
+| `--fmha-perf-instrument` | Enables NVTX performance profiling for FMHA. | False |
+| `--fmha-show-params` | Displays FMHA parameter information. | False |
+| `--disable-flash-infer` | Disables FlashInfer Attention mechanism. | False |
+| `--enable-xqa` | Enables XQA feature (requires SM90+ GPU). | True |
 
 ## KV Cache Configuration
 
@@ -198,109 +188,4 @@ The following legacy options and environment variables were removed and must no 
 
 | Arguments | Description | Defaults |
 |-----------|-------------|----------|
-| `--load_method` | Specify the weight loading method.<br>Options: auto, fastsafetensors, scratch (`LOAD_METHOD`) | auto |
-| `--force_cpu_load_weights` | Load weights on CPU to reduce device memory usage (`FORCE_CPU_LOAD_WEIGHTS`) | False |
-| `--loader_recycle_handles` | ROCm + safetensors only: close consumed main-model shard handles to release mmap memory. Requires layer-numbered tensors and copies safetensors data out before closing; no effect on fastsafetensors, ViT, EPLB, or .bin weights. (`LOADER_RECYCLE_HANDLES`) | True |
-| `--moe_pure_tp_preshard` | Disabled by default. Set true to pre-shard supported Qwen3-Next / Qwen3.5 MoE and offline FP8 weights under pure TP (`tp>1, dp=1, ep=1`) before device copy. Unsupported sources or layouts warn and use legacy full reads. (`MOE_PURE_TP_PRESHARD`) | False |
-
-### FastSafeTensors loader configuration
-
-When `LOAD_METHOD=fastsafetensors`, or when the default `auto` mode selects the
-FastSafeTensors path, RTP-LLM uses the config-driven `AutoLoader`. RTP checks
-the installed package capabilities before loading: the full capability set uses
-bounded `per-expert` delivery, a package without `stacked_moe_tensors` (or the
-legacy `dim0_split_templates` alias) falls
-back to the higher-memory `full-stacked` compatibility path, and a package
-without `local_copyout_filter` continues with full materialization and RTP
-consumer-side filtering. A missing package/`AutoLoader`, an import/ABI failure,
-an unmet AUTO prerequisite, or an insufficient AUTO memory preflight falls back
-to `scratch`. Explicit `LOAD_METHOD=fastsafetensors` treats `per-expert` as a
-user override and skips the memory preflight; explicit `full-stacked` keeps the
-preflight when RTP detects a raw stacked MoE checkpoint, because that path
-materializes a complete stacked tensor. Dense and already per-expert checkpoints
-do not run this stacked-tensor preflight. Clear import, API, constructor, and ABI
-compatibility failures fall back to scratch in either entry mode, while
-checkpoint/data errors remain fail-fast.
-The two optional keywords control independent optimizations:
-
-| Capability | Present | Missing |
-|---|---|---|
-| `local_copyout_filter` | rank-local copy-out | full materialization, RTP consumer filtering |
-| `stacked_moe_tensors` (legacy alias: `dim0_split_templates`) | bounded `per-expert` MoE delivery | `full-stacked` MoE delivery |
-
-When a degraded FastSafeTensors mode remains usable, RTP logs
-`requested_mode`, `effective_mode` and `degraded_reason`; rank-local copy-out
-degradation uses the same fields with `effective_mode=consumer-filter`. Every
-scratch fallback contains `falls back to scratch`; package absence is INFO and
-normal AUTO prerequisite rejection is also INFO. Compatibility, capability and
-memory-preflight fallback causes are WARNING. CI or image builds that require
-both optimizations must install the matching wheel and treat a missing
-capability as a packaging failure. Set
-`RTP_LLM_EXPECT_FASTSAFETENSORS_TIER=per-expert` for the installed wheel
-contract test to turn a lower tier into a test failure; supported tiers are
-`scratch`, `consumer-filter`, `full-stacked`, and `per-expert`.
-
-Pass the standard fastsafetensors configuration as either an inline JSON string
-or a JSON file path. The installed FastSafeTensors version defines the precise
-configuration defaults and precedence:
-
-```bash
-# Inline JSON string; progress is controlled by the upstream parallel config.
-export FASTSAFETENSORS_CONFIG_JSON='{"loader":"base","base":{"copier_type":"nogds"},"parallel":{"use_tqdm_on_load":true}}'
-
-# JSON file path; the file contains the same JSON object
-export FASTSAFETENSORS_CONFIG=/path/to/fastsafetensors.json
-```
-
-The same configuration also affects `auto` selection. RTP reads
-`estimated_peak_device_bytes` from the installed package; missing or invalid
-values use the historical `3 × max checkpoint shard` estimate. RTP then adds a
-2 GiB empirical reserve for TensorCollector inputs that overlap final weight
-materialization. This reserve is an integration estimate pending calibration
-with stacked-MoE peak-memory measurements. Larger buffers, queues or producer
-counts can raise `transient_mem` enough for `auto` to choose `scratch`. Inspect
-the `fastsafetensor memory check` log and its `enough` field; this log is not
-emitted for explicit per-expert loading because that mode skips preflight.
-
-For compatibility with existing development environments,
-`FASTSAFETENSORS_NOGDS=1` remains supported. Before memory preflight or
-constructing `AutoLoader`, RTP-LLM overrides `FASTSAFETENSORS_CONFIG_JSON`
-process-wide with
-`{"loader":"base","base":{"copier_type":"nogds"}}`. This compatibility switch
-therefore remains in effect for subsequent loaders in the same process. Prefer
-one of the standard configuration variables above for new deployments. When
-`FASTSAFETENSORS_CONFIG` is also set, the final precedence remains an upstream
-package contract; current pinned wheels prefer the inline JSON value.
-
-Stacked MoE checkpoints use bounded-memory per-expert delivery by default: the
-source rank slices the stacked tensor first, then every rank broadcasts one
-expert at a time. The higher-memory full-stacked path is a temporary
-compatibility rollback for wheels or deployments that cannot use the bounded
-split path, and it may also be used for controlled performance comparisons:
-
-```bash
-export RTP_FASTSAFETENSORS_STACKED_MOE_MODE=full-stacked
-```
-
-The accepted values are `per-expert` (default) and `full-stacked`; an empty
-value also selects the default. When the checkpoint actually contains raw
-stacked MoE tensors, `full-stacked` adds a conservative extra shard to the
-FastSafeTensors memory preflight because it materializes a whole stacked tensor
-before RTP clones expert slices. Dense or already per-expert checkpoints do not
-pay this add-on. A passive downgrade logs a warning with
-`degraded_reason`; an explicit request is reported as the selected mode. The
-additional warning is emitted only when the checkpoint actually contains raw
-stacked MoE tensors. Use `LOAD_METHOD=scratch` as the more conservative
-rollback. This transitional RTP switch only selects stacked MoE delivery.
-Bucket size, copier/backend, queue depth, producer count, loading progress and
-tensor ordering are otherwise owned by the installed FastSafeTensors
-configuration; rank-local copy-out is supplied by RTP's local checkpoint-key
-predicate.
-
-`RTP_FASTSAFETENSORS_STACKED_MOE_MODE` is a transitional, environment-only
-switch: it has no command-line flag, is not shown by `--help`, and is not part
-of the startup config dump. It is read only when the FastSafeTensors path is
-considered. Values are case-sensitive and use a hyphen; any non-empty value
-other than `per-expert` or `full-stacked` raises `ValueError` during
-FastSafeTensors selection. It has no effect for `LOAD_METHOD=scratch` or for
-weights that cannot use the FastSafeTensors path.
+| `--load_method` | Specify the weight loading method.<br>Options: auto, fastsafetensors, scratch | auto |

@@ -3,16 +3,15 @@ import json
 import logging
 import os
 import re
+import time
 from pathlib import Path
-from typing import Any, Callable, Dict, Generator, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Generator, List, Optional, Tuple
 
 import torch
+from tqdm.auto import tqdm
 
 from rtp_llm.lora.lora_file import LoraCkpt
-from rtp_llm.utils import ckpt_file_info
 from rtp_llm.utils.ckpt_file_info import CkptFileInfo, FinetuneType
-
-_LAYER_RE = re.compile(r"(?:^|\.)(?:layers|h|blocks|layer)\.(\d+)\.")
 
 FASTSAFETENSORS_STACKED_MOE_MODE_ENV = "RTP_FASTSAFETENSORS_STACKED_MOE_MODE"
 FASTSAFETENSORS_STACKED_MOE_MODE_PER_EXPERT = "per-expert"
@@ -224,12 +223,9 @@ class CkptDatabase(BaseDatabase):
 
     finetune_type: FinetuneType
 
-    def __init__(
-        self,
-        path: Optional[str],
-        ptuning_path: Optional[str] = None,
-        recycle_handles: bool = False,
-    ) -> None:
+    def __init__(self, path: Optional[str], ptuning_path: Optional[str] = None) -> None:
+        # ckpt directory; used to read config.json on demand
+        self.path: Optional[str] = path
 
         if path is None:
             return
@@ -237,17 +233,11 @@ class CkptDatabase(BaseDatabase):
         self.pretrain_file_list = []
         self.finetune_file_list = []
         self.lora_ckpt = LoraCkpt()
-        self._tensor_index: Dict[str, CkptFileInfo] = {}
-        self._loaded_layer = -1
-        # Safe only because ROCm reads copy out of the mmap; handles reopen lazily.
-        self._recycle_handles = recycle_handles and ckpt_file_info.ROCM_COPY_OUT
-        self._file_max_layer: Dict[CkptFileInfo, int] = {}
 
         if os.path.isfile(path):
             raise Exception(f"CkptDatabase needs directory contains checkpoint files")
 
         self.load_hf_meta(path)
-        self._recycle_handles = self._recycle_handles and self.is_safetensor
 
         self.load_ptuning_meta(ptuning_path)
 
@@ -261,35 +251,17 @@ class CkptDatabase(BaseDatabase):
             f"CkptDatabase all tensor names = {self.get_pretrain_tensor_names()}"
         )
 
+        # Build tensor_name -> CkptFileInfo index for O(1) lookup.
+        # If a tensor name appears in multiple files, the last file wins.
+        # In practice safetensors checkpoints guarantee each tensor is in
+        # exactly one shard, so duplicates should not occur.
+        self._tensor_index: Dict[str, CkptFileInfo] = {}
         for ckpt_file in self.pretrain_file_list:
             for tname in ckpt_file.metadata.keys():
                 self._tensor_index[tname] = ckpt_file
-                if self._recycle_handles and (match := _LAYER_RE.search(tname)):
-                    self._file_max_layer[ckpt_file] = max(
-                        self._file_max_layer.get(ckpt_file, -1), int(match.group(1))
-                    )
         for ckpt_file in self.finetune_file_list:
             for tname in ckpt_file.metadata.keys():
                 self._tensor_index[tname] = ckpt_file
-        logging.info(
-            f"CkptDatabase recycle_handles={self._recycle_handles} (asked={recycle_handles},"
-            f" copy_out={ckpt_file_info.ROCM_COPY_OUT}, shards={len(self._file_max_layer)})"
-        )
-        if self._recycle_handles and not self._file_max_layer:
-            logging.warning("recycle_handles on but no layer-numbered tensors; no-op")
-
-    def _recycle_consumed_shards(self, name: str) -> None:
-        """Close shards fully below the previous layer (one-layer in-flight slack)."""
-        match = _LAYER_RE.search(name) if self._recycle_handles else None
-        if match is None:
-            return
-        layer = int(match.group(1))
-        if layer <= self._loaded_layer:
-            return
-        self._loaded_layer = layer
-        for ckpt, max_layer in self._file_max_layer.items():
-            if max_layer < layer - 1:
-                ckpt.close_safetensor_handle()
 
     @property
     def is_ft_style(self) -> bool:
@@ -401,22 +373,8 @@ class CkptDatabase(BaseDatabase):
     ) -> List[torch.Tensor]:
         ckpt_file = self._tensor_index.get(name)
         if ckpt_file is not None:
-            self._recycle_consumed_shards(name)
             return [ckpt_file.load_tensor(name, data_type)]
         return []
-
-    def load_tensor_slice(
-        self,
-        name: str,
-        tensor_slice: Tuple[Union[int, slice], ...],
-        data_type: torch.dtype,
-    ) -> torch.Tensor:
-        ckpt_file = self._tensor_index[name]
-        self._recycle_consumed_shards(name)
-        return ckpt_file.load_tensor_slice(name, tensor_slice, data_type)
-
-    def get_tensor_shape(self, name: str) -> torch.Size:
-        return self._tensor_index[name].get_tensor_shape(name)
 
     def has_tensor(self, name: str) -> bool:
         return name in self._tensor_index
