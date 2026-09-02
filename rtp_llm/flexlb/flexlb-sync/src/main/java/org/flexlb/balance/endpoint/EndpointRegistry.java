@@ -257,7 +257,6 @@ public class EndpointRegistry {
      * <p>The routing values are advisory and may change after selection. The
      * subsequent reservation/dispatch transaction revalidates capacity under
      * the endpoint admission lock. Requiring an identical admission version
-     * here would turn ordinary request traffic into a false placement miss.
      * Every rejected or exceptional capture is closed here; a successful
      * caller owns the returned generation pin.</p>
      */
@@ -448,11 +447,9 @@ public class EndpointRegistry {
             ConcurrentHashMap<String, WorkerEndpoint> endpoints,
             String address,
             BiFunction<String, WorkerEndpoint, WorkerEndpoint> mutation) {
-        if (role == RoleType.PREFILL) {
-            return mutatePrefillEndpointMap(
-                    endpoints, address, mutation);
-        }
-        if (role != RoleType.DECODE) {
+        boolean updatesPrefillDirectory = role == RoleType.PREFILL;
+        boolean updatesDecodeDirectory = role == RoleType.DECODE;
+        if (!updatesPrefillDirectory && !updatesDecodeDirectory) {
             return endpoints.compute(address, mutation);
         }
         synchronized (lifecycleGate) {
@@ -461,62 +458,36 @@ public class EndpointRegistry {
             if (next == exactCurrent) {
                 return exactCurrent;
             }
-            List<Map.Entry<String, DecodeEndpoint>> nextDirectory =
-                    decodeDirectoryAfterMutationLocked(
-                    decodeDirectory,
-                    address,
-                    (DecodeEndpoint) next);
+            List<String> nextPrefillDirectory = updatesPrefillDirectory
+                    ? registryPhase == RegistryPhase.OPEN
+                            ? prefillDirectoryAfterMutationLocked(
+                                    prefillAddressDirectory,
+                                    address,
+                                    exactCurrent,
+                                    next)
+                            : List.of()
+                    : null;
+            List<Map.Entry<String, DecodeEndpoint>> nextDecodeDirectory =
+                    updatesDecodeDirectory
+                            ? decodeDirectoryAfterMutationLocked(
+                                    this.decodeDirectory,
+                                    address,
+                                    (DecodeEndpoint) next)
+                            : null;
             WorkerEndpoint published = endpoints.compute(
                     address, (ignored, observed) -> {
                 if (observed != exactCurrent) {
                     throw new IllegalStateException(
-                            "Decode endpoint mapping changed outside its directory transaction: "
+                            role + " endpoint mapping changed outside its directory transaction: "
                                     + address);
                 }
                 return next;
             });
-            decodeDirectory = nextDirectory;
-            return published;
-        }
-    }
-
-    /**
-     * Apply one Prefill map mutation and its immutable address publication as a
-     * single writer transaction.
-     *
-     * <p>The next directory is fully allocated before the CHM write. A failed
-     * mutation therefore leaves the previous directory published. Replacement
-     * at an existing address reuses that exact directory instance because
-     * generation ownership is established only by {@link #capture}.</p>
-     */
-    private WorkerEndpoint mutatePrefillEndpointMap(
-            ConcurrentHashMap<String, WorkerEndpoint> endpoints,
-            String address,
-            BiFunction<String, WorkerEndpoint, WorkerEndpoint> mutation) {
-        synchronized (lifecycleGate) {
-            WorkerEndpoint exactCurrent = endpoints.get(address);
-            WorkerEndpoint next = mutation.apply(address, exactCurrent);
-            if (next == exactCurrent) {
-                return exactCurrent;
+            if (updatesPrefillDirectory) {
+                prefillAddressDirectory = nextPrefillDirectory;
+            } else {
+                this.decodeDirectory = nextDecodeDirectory;
             }
-
-            List<String> nextDirectory = registryPhase == RegistryPhase.OPEN
-                    ? prefillDirectoryAfterMutationLocked(
-                            prefillAddressDirectory,
-                            address,
-                            exactCurrent,
-                            next)
-                    : List.of();
-            WorkerEndpoint published = endpoints.compute(
-                    address, (ignored, observed) -> {
-                if (observed != exactCurrent) {
-                    throw new IllegalStateException(
-                            "Prefill endpoint mapping changed outside its directory transaction: "
-                                    + address);
-                }
-                return next;
-            });
-            prefillAddressDirectory = nextDirectory;
             return published;
         }
     }
