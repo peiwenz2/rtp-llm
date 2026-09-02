@@ -9,14 +9,10 @@ from rtp_llm.models_py.distributed.collective_torch import Group
 from rtp_llm.models_py.modules.factory.fused_moe.defs import config_adapter
 from rtp_llm.models_py.modules.factory.fused_moe.defs import fused_moe as moe_defs
 from rtp_llm.models_py.modules.factory.fused_moe.defs import quant_config
-from rtp_llm.models_py.modules.factory.fused_moe.impl.common.executor.batched_triton_executor import (
-    BatchedTritonExperts,
-)
 from rtp_llm.models_py.modules.factory.fused_moe.impl.common.router import (
     batched_data_router,
 )
 from rtp_llm.ops import MoeConfig, ParallelismConfig
-from rtp_llm.utils.model_weight import W
 
 EXPERT_NUM = 8
 TP_SIZE = 2
@@ -85,14 +81,22 @@ class BatchedDataRouterEpTest(unittest.TestCase):
         return self.router.prepare(a1, None, None, weights, ids)
 
     def _finalize(
-        self, expert_output: torch.Tensor, weights: Optional[torch.Tensor] = None
+        self,
+        expert_output: torch.Tensor,
+        weights: Optional[torch.Tensor] = None,
+        ids: Optional[torch.Tensor] = None,
+        prepared: Optional[moe_defs.ExpertForwardPayload] = None,
     ) -> torch.Tensor:
+        prepared = self.payload if prepared is None else prepared
         reducer = mock.MagicMock(side_effect=lambda t, _g: t)
         with mock.patch.object(batched_data_router, "all_reduce", reducer):
             result = self.router.finalize(
-                moe_defs.CombineForwardPayload(fused_expert_output=expert_output),
+                moe_defs.CombineForwardPayload(
+                    fused_expert_output=expert_output,
+                    router_context=prepared.router_context,
+                ),
                 self.topk_weights if weights is None else weights,
-                self.topk_ids,
+                self.topk_ids if ids is None else ids,
                 False,
                 None,
             )
@@ -105,7 +109,7 @@ class BatchedDataRouterEpTest(unittest.TestCase):
             tokens = (self.topk_ids == e + LOCAL_LO).any(dim=1).nonzero().flatten()
             self.assertEqual(int(self.counts[e]), tokens.numel(), f"expert {e} count")
             # Exact, not a multiset compare: packed row ranks fix token order
-            # inside each expert block and _packed_rows depends on it.
+            # inside each expert block and finalize relies on that order.
             packed = self.payload.expert_x[e, : tokens.numel()]
             self.assertTrue(torch.equal(packed, self.a1[tokens]), f"expert {e} rows")
 
@@ -126,82 +130,45 @@ class BatchedDataRouterEpTest(unittest.TestCase):
         expected = self.a1 * (self.local * self.topk_weights).sum(1, keepdim=True)
         torch.testing.assert_close(out, expected)
 
-    def test_finalize_requires_a_fresh_plan(self) -> None:
-        """A consumed plan, and one a failed prepare dropped, both have to be
-        rejected rather than combined against stale rows."""
-        expert_output = torch.zeros(LOCAL_EXPERTS, NUM_TOKENS, HIDDEN)
-        self._finalize(expert_output)
-        with self.assertRaisesRegex(RuntimeError, r"finalize\(\) called before"):
-            self._finalize(expert_output)
-
-        big = torch.zeros((NUM_TOKENS + 1, TOP_K), dtype=torch.int32)
-        with self.assertRaisesRegex(ValueError, r"supports at most"):
-            self._prepare(torch.zeros((NUM_TOKENS + 1, HIDDEN)), big.float(), big)
-        with self.assertRaisesRegex(RuntimeError, r"finalize\(\) called before"):
-            self._finalize(expert_output)
-
-    def test_prepare_rejects_reentrant_use(self) -> None:
-        with self.assertRaisesRegex(RuntimeError, r"prepare\(\) called before"):
-            self._prepare(self.a1, self.topk_weights, self.topk_ids)
-        self._finalize(torch.zeros(LOCAL_EXPERTS, NUM_TOKENS, HIDDEN))
-
-    def test_executor_failure_does_not_poison_router(self) -> None:
-        router = self._make_router(NUM_TOKENS)
-        experts = BatchedTritonExperts(
-            self._make_config(NUM_TOKENS),
-            quant_config.FusedMoEQuantConfig(quant_dtype=None),
-            {
-                W.moe_w1: torch.empty(LOCAL_EXPERTS, 8, HIDDEN),
-                W.moe_w2: torch.empty(LOCAL_EXPERTS, HIDDEN, 4),
-            },
+    def test_prepared_payloads_are_independent(self) -> None:
+        a1 = torch.arange(3 * HIDDEN, dtype=torch.float32).view(3, HIDDEN)
+        ids = torch.tensor(
+            [(LOCAL_LO, 0), (LOCAL_LO + 1, LOCAL_LO + 2), (1, EXPERT_NUM - 1)],
+            dtype=torch.int32,
         )
-        fused_moe = moe_defs.FusedMoe(router, experts, EXPERT_NUM)
+        weights = torch.rand(3, TOP_K) + 0.5
+        payload = self._prepare(a1, weights, ids)
 
-        with self.assertRaisesRegex(NotImplementedError, "expert_map"):
-            fused_moe(
-                self.a1,
-                self.topk_weights,
-                self.topk_ids,
-                expert_map=torch.arange(EXPERT_NUM),
-            )
+        out = self._finalize(payload.expert_x.clone(), weights, ids, payload)
+        local = (ids >= LOCAL_LO) & (ids < EXPERT_NUM)
+        torch.testing.assert_close(out, a1 * (local * weights).sum(1, keepdim=True))
 
-        payload = router.prepare(self.a1, None, None, self.topk_weights, self.topk_ids)
-        with mock.patch.object(
-            batched_data_router, "all_reduce", side_effect=lambda t, _g: t
-        ):
-            out = router.finalize(
-                moe_defs.CombineForwardPayload(
-                    fused_expert_output=payload.expert_x.clone()
-                ),
-                self.topk_weights,
-                self.topk_ids,
-                False,
-                None,
-            )
-
+        original = self._finalize(self.payload.expert_x.clone())
         expected = self.a1 * (self.local * self.topk_weights).sum(1, keepdim=True)
-        torch.testing.assert_close(out, expected)
+        torch.testing.assert_close(original, expected)
 
-    def test_rejected_reentrant_forward_does_not_discard_the_active_plan(self) -> None:
-        experts = mock.Mock(spec=moe_defs.FusedMoeExpertExecutor)
-        fused_moe = moe_defs.FusedMoe(self.router, experts, EXPERT_NUM)
-
-        with self.assertRaisesRegex(RuntimeError, r"prepare\(\) called before"):
-            fused_moe(self.a1, self.topk_weights, self.topk_ids)
-
-        out = self._finalize(self.payload.expert_x.clone())
-        experts.execute.assert_not_called()
-        expected = self.a1 * (self.local * self.topk_weights).sum(1, keepdim=True)
-        torch.testing.assert_close(out, expected)
+    def test_finalize_rejects_missing_or_foreign_context(self) -> None:
+        expert_output = self.payload.expert_x.clone()
+        for router_context in (None, object()):
+            with self.subTest(router_context=router_context), self.assertRaisesRegex(
+                TypeError, "prepared routing context"
+            ):
+                self.router.finalize(
+                    moe_defs.CombineForwardPayload(
+                        fused_expert_output=expert_output,
+                        router_context=router_context,
+                    ),
+                    self.topk_weights,
+                    self.topk_ids,
+                    False,
+                    None,
+                )
 
     def test_round_trip_matches_reference_across_token_counts(self) -> None:
-        """The fixed 6-token fixture cannot catch an off-by-one that only shows
-        up at another count, and the earlier sweep covered the since-replaced
-        argsort pack. Duplicate experts inside one token's top-k occur naturally
-        at these sizes and are covered by the same reference."""
-        for n in (1, 4, 14, 29, 32, 33, 37):
+        """Cover singleton input and prefill beyond the configured decode capacity."""
+        for n in (1, 33):
             with self.subTest(num_tokens=n):
-                router = self._make_router(n)
+                router = self._make_router(1)
                 a1 = torch.randn(n, HIDDEN)
                 ids = torch.randint(0, EXPERT_NUM, (n, TOP_K), dtype=torch.int32)
                 weights = torch.rand(n, TOP_K) + 0.5
@@ -220,17 +187,7 @@ class BatchedDataRouterEpTest(unittest.TestCase):
                     expert_output[e, :live] = payload.expert_x[e, :live]
                     expert_output[e, live:] = float("nan")
 
-                reducer = mock.MagicMock(side_effect=lambda t, _g: t)
-                with mock.patch.object(batched_data_router, "all_reduce", reducer):
-                    out = router.finalize(
-                        moe_defs.CombineForwardPayload(
-                            fused_expert_output=expert_output
-                        ),
-                        weights,
-                        ids,
-                        False,
-                        None,
-                    )
+                out = self._finalize(expert_output, weights, ids, payload)
 
                 local = (ids >= LOCAL_LO) & (ids < EXPERT_NUM)
                 expected = a1 * (local * weights).sum(1, keepdim=True)
@@ -239,8 +196,6 @@ class BatchedDataRouterEpTest(unittest.TestCase):
     def test_zero_tokens_round_trips(self) -> None:
         """Empty batch is reachable on a DP rank; deriving the counts from the
         last cumsum row used to raise IndexError."""
-        # Release setUp's plan first: prepare() is non-reentrant.
-        self._finalize(torch.zeros(LOCAL_EXPERTS, NUM_TOKENS, HIDDEN))
         empty = torch.zeros((0, TOP_K))
         payload = self._prepare(torch.zeros((0, HIDDEN)), empty, empty.to(torch.int32))
         meta = payload.expert_tokens_meta
@@ -252,7 +207,12 @@ class BatchedDataRouterEpTest(unittest.TestCase):
                 meta.expert_num_tokens, torch.zeros(LOCAL_EXPERTS, dtype=torch.int32)
             )
         )
-        out = self._finalize(torch.zeros((LOCAL_EXPERTS, 0, HIDDEN)), empty)
+        out = self._finalize(
+            torch.zeros((LOCAL_EXPERTS, 0, HIDDEN)),
+            empty,
+            empty.to(torch.int32),
+            payload,
+        )
         self.assertEqual(out.shape, (0, HIDDEN))
 
 

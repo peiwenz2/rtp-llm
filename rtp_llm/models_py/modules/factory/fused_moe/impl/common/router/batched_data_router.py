@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from typing import Any, Optional
 
 import torch
@@ -19,6 +20,12 @@ from rtp_llm.models_py.modules.factory.fused_moe.defs.quant_config import (
 from rtp_llm.models_py.modules.factory.fused_moe.defs.type import RouterType
 
 
+@dataclass(frozen=True, slots=True)
+class _BatchedRoutingPlan:
+    packed_rows: torch.Tensor
+    routed: torch.Tensor
+
+
 class BatchedDataRouter(FusedMoeDataRouter):
     """Router for the batched expert-output layout.
 
@@ -26,9 +33,7 @@ class BatchedDataRouter(FusedMoeDataRouter):
     not the pure-TP partial-output contract that GenericMoeLayer's unified
     shared-expert reduction needs, so it does not advertise deferral.
 
-    The expert block is ``local_experts x num_tokens x hidden``. A positive
-    ``ll_num_max_token`` is required to keep the allocation bounded. Instances
-    are non-reentrant: each ``prepare`` must be paired with one ``finalize``.
+    The expert block is ``local_experts x num_tokens x hidden``.
     """
 
     @classmethod
@@ -44,7 +49,6 @@ class BatchedDataRouter(FusedMoeDataRouter):
         resolver = MoeConfigResolver()
         checker.check(not resolver.has_quantization(config))
         checker.check(resolver.is_tp_equal_ep(config))
-        checker.check(config.ll_num_max_token > 0)
 
     def __init__(
         self,
@@ -55,9 +59,6 @@ class BatchedDataRouter(FusedMoeDataRouter):
 
         self.ep_rank = config.ep_rank
         self.num_local_experts = config.expert_num // config.ep_size
-        self.max_num_tokens = config.ll_num_max_token
-        self._packed_rows: Optional[torch.Tensor] = None
-        self._routed: Optional[torch.Tensor] = None
 
     def prepare(
         self,
@@ -67,8 +68,6 @@ class BatchedDataRouter(FusedMoeDataRouter):
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
     ) -> ExpertForwardPayload:
-        if self._packed_rows is not None or self._routed is not None:
-            raise RuntimeError("prepare() called before finalize()")
         if a1.dim() != 2 or topk_weights.dim() != 2 or topk_ids.dim() != 2:
             raise ValueError("a1, topk_weights, and topk_ids must be rank-2 tensors")
         if a1.size(0) != topk_ids.size(0):
@@ -79,20 +78,16 @@ class BatchedDataRouter(FusedMoeDataRouter):
             raise ValueError("BatchedDataRouter does not support quantized MoE")
 
         num_tokens = a1.size(0)
-        if num_tokens > self.max_num_tokens:
-            raise ValueError(
-                f"BatchedDataRouter supports at most {self.max_num_tokens} tokens, "
-                f"got {num_tokens}; lower the batch or use a non-batched router"
-            )
         num_experts = self.num_local_experts
         token_ids = torch.arange(num_tokens, device=a1.device, dtype=torch.int32)
 
         # Shapes below depend only on num_tokens, keeping the plan CUDA-Graph
         # capturable: no boolean indexing, no device-to-host expert counts.
-        local_ids = topk_ids.to(torch.int32) - num_experts * self.ep_rank
-        routed = (local_ids >= 0) & (local_ids < num_experts)
+        slots = topk_ids.to(dtype=torch.int64, copy=True)
+        slots.sub_(num_experts * self.ep_rank)
+        routed = (slots >= 0) & (slots < num_experts)
         # Column num_experts is scratch: non-local ids cannot hit a real column.
-        slots = torch.where(routed, local_ids, num_experts)
+        slots.masked_fill_(~routed, num_experts)
         match = torch.zeros(
             (num_tokens, num_experts + 1), dtype=torch.bool, device=a1.device
         ).scatter_(1, slots, routed)
@@ -114,19 +109,13 @@ class BatchedDataRouter(FusedMoeDataRouter):
         token_indices = token_indices[:num_experts]
         expert_num_tokens = match[:, :num_experts].sum(0, dtype=torch.int32)
         expert_x = a1[token_indices]
-        payload = ExpertForwardPayload(
+        return ExpertForwardPayload(
             expert_x=expert_x,
             expert_tokens_meta=ExpertTokensMetadata(
                 expert_num_tokens=expert_num_tokens
             ),
+            router_context=_BatchedRoutingPlan(packed_rows, routed),
         )
-        self._packed_rows = packed_rows
-        self._routed = routed
-        return payload
-
-    def abort_forward(self) -> None:
-        self._packed_rows = None
-        self._routed = None
 
     def finalize(
         self,
@@ -136,9 +125,10 @@ class BatchedDataRouter(FusedMoeDataRouter):
         apply_router_weight_on_input: bool,
         extra_finalize_args: Optional[FinalizeArgs],
     ) -> torch.Tensor:
-        packed_rows, routed = self._packed_rows, self._routed
-        if packed_rows is None or routed is None:
-            raise RuntimeError("finalize() called before prepare()")
+        plan = payload.router_context
+        if not isinstance(plan, _BatchedRoutingPlan):
+            raise TypeError("BatchedDataRouter requires its prepared routing context")
+        packed_rows, routed = plan.packed_rows, plan.routed
 
         expert_output = payload.fused_expert_output
         num_tokens, top_k = packed_rows.size()
@@ -150,10 +140,6 @@ class BatchedDataRouter(FusedMoeDataRouter):
             )
 
         hidden_dim = expert_output.size(-1)
-        # Payload shape is validated above, so it stays retryable; past this point
-        # the plan is spent either way, or a failed collective would wedge
-        # prepare() into rejecting every later call.
-        self.abort_forward()
         rows = (
             expert_output.reshape(-1, hidden_dim)
             .index_select(0, packed_rows.reshape(-1))
