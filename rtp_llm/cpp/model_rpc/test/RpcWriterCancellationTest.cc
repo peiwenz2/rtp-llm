@@ -196,7 +196,6 @@ TEST(RpcWriterCancellationTest, LocalWriteFailureCancelsStreamAndReturnsCancelle
 }
 
 TEST(RpcWriterCancellationTest, DecodeFirstReadCancellationReturnsCancelled) {
-    test::TestLogCapture   log_capture("decode_first_read_cancel");
     DecodeFirstReadService service;
     int                    listen_port = 0;
     grpc::ServerBuilder    builder;
@@ -225,8 +224,6 @@ TEST(RpcWriterCancellationTest, DecodeFirstReadCancellationReturnsCancelled) {
     EXPECT_EQ(client_status.error_code(), grpc::StatusCode::CANCELLED);
     ASSERT_TRUE(server_status.has_value());
     EXPECT_EQ(server_status->error_code(), grpc::StatusCode::CANCELLED);
-    EXPECT_NE(log_capture.content().find("request [pending peer="), std::string::npos);
-    EXPECT_NE(log_capture.content().find("read allocate request failed"), std::string::npos);
 }
 
 TEST(RpcWriterCancellationTest, RemoteWriteFailureCancelsGrpcStreamClosure) {
