@@ -186,7 +186,7 @@ def _build_batched_moe(rank, parallelism_config):
     model_config.expert_num = 8
     model_config.moe_k = 2
     model_config.activation_type = ActivationType.Swiglu
-    model_config.data_type = torch.bfloat16
+    model_config.data_type = "bf16"
     moe_config = MoeConfig()
     moe_config.ll_num_max_token = 1
     config = MoEConfigAdapter(model_config, parallelism_config, moe_config)
