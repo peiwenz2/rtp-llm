@@ -6,6 +6,7 @@
 #include <atomic>
 #include <memory>
 #include <mutex>
+#include <utility>
 
 namespace rtp_llm {
 
@@ -21,6 +22,8 @@ struct StreamThinkInfo {
     int                                            max_thinking_tokens;
     std::vector<int>                               begin_think_token_ids;
     std::vector<int>                               end_think_token_ids;
+    std::vector<int>                               reasoning_stop_token_ids;
+    std::vector<int>                               boundary_history;
     int32_t                                        input_length;
     int32_t                                        current_output_length;
     bool                                           is_beam_search;
@@ -37,16 +40,18 @@ struct StreamThinkInfo {
                     int32_t                                        input_length,
                     int32_t                                        output_length,
                     bool                                           is_beam_search,
-                    std::shared_ptr<StringContainDFA<size_t, int>> dfa_ptr):
+                    std::shared_ptr<StringContainDFA<size_t, int>> dfa_ptr,
+                    std::vector<int>                               reasoning_stop_token_ids = {}):
         in_think_mode(think_mode),
         max_thinking_tokens(max_thinking_tokens),
-        begin_think_token_ids(begin_think_token_ids),
-        end_think_token_ids(end_think_token_ids),
+        begin_think_token_ids(std::move(begin_think_token_ids)),
+        end_think_token_ids(std::move(end_think_token_ids)),
+        reasoning_stop_token_ids(std::move(reasoning_stop_token_ids)),
         input_length(input_length),
         current_output_length(output_length),
         is_beam_search(is_beam_search),
-        dfa_ptr(dfa_ptr) {
-        if (think_mode && max_thinking_tokens > 0 && dfa_ptr) {
+        dfa_ptr(std::move(dfa_ptr)) {
+        if (think_mode && this->dfa_ptr) {
             process_state = ThinkProcessState::IN_THINK;
         }
     }
@@ -57,6 +62,8 @@ struct StreamThinkInfo {
         think_info.max_thinking_tokens                = max_thinking_tokens;
         think_info.begin_think_token_ids              = begin_think_token_ids;
         think_info.end_think_token_ids                = end_think_token_ids;
+        think_info.reasoning_stop_token_ids            = reasoning_stop_token_ids;
+        think_info.boundary_history                    = boundary_history;
         think_info.input_length                       = input_length;
         think_info.current_output_length              = current_output_length;
         think_info.is_beam_search                     = is_beam_search;
@@ -67,6 +74,19 @@ struct StreamThinkInfo {
         }
         return think_info;
     }
+
+    bool    isActive() const;
+    bool    transitionToAfterThinkIfClosed();
+    bool    closeInProgress() const;
+    int32_t beginBoundaryTokenToMask() const;
+    int32_t endBoundaryTokenToMask() const;
+    bool    consumePendingForcedToken(int32_t token_id);
+    void    advanceToken(int32_t token_id);
+    void    precommitForcedToken(int32_t token_id);
+
+private:
+    int32_t tokenCompletingBoundary(const std::vector<int>& boundary) const;
+    void    advanceBoundaryHistory(int32_t token_id);
 };
 
 struct ThinkModeSpecSnapshot {
@@ -82,8 +102,8 @@ public:
     virtual ~ThinkModeLogitsProcessor() {}
 
 public:
-    static std::shared_ptr<ThinkModeLogitsProcessor> fromGenerateInput(std::shared_ptr<GenerateInput> generate_input,
-                                                                       int32_t                        num);
+    static std::shared_ptr<ThinkModeLogitsProcessor>
+    fromGenerateInput(std::shared_ptr<GenerateInput> generate_input, int32_t num, int64_t eos_token_id = -1);
 
 public:
     void process(const SamplerInputs& inputs, size_t start_idx, size_t finish_idx) override;
@@ -95,7 +115,10 @@ public:
     int64_t acceptedTokenLen() const override;
 
 private:
-    bool forceThinkEndToken(const torch::Tensor& new_tokens_logits, StreamThinkInfo& info, size_t vocab_size);
+    bool forceThinkEndToken(const torch::Tensor& new_tokens_logits,
+                            StreamThinkInfo&     info,
+                            size_t               vocab_size,
+                            const char*          trigger);
 
 public:
     std::vector<size_t> thinkEndTokensStatus();

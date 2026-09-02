@@ -34,10 +34,46 @@ std::string makeTokenizerInfoJson() {
     return info.SerializeJSON();
 }
 
+std::string makeKimiK3TokenizerInfoJson() {
+    std::vector<std::string> vocab;
+    vocab.reserve(260);
+    for (int i = 0; i < 256; ++i) {
+        vocab.emplace_back(1, static_cast<char>(i));
+    }
+    vocab.emplace_back("<|open|>");
+    vocab.emplace_back("<|close|>");
+    vocab.emplace_back("<|sep|>");
+    vocab.emplace_back("<|end_of_msg|>");
+    xgrammar::TokenizerInfo info(vocab,
+                                 xgrammar::VocabType::RAW,
+                                 /*vocab_size=*/260,
+                                 /*stop_token_ids=*/std::vector<int32_t>{259});
+    return info.SerializeJSON();
+}
+
 XGrammarBackendCpp makeBackend() {
     XGrammarBackendOptions options;
     options.max_compiler_threads = 1;
     return XGrammarBackendCpp(makeTokenizerInfoJson(), options);
+}
+
+XGrammarBackendCpp makeKimiK3Backend() {
+    XGrammarBackendOptions options;
+    options.max_compiler_threads = 1;
+    return XGrammarBackendCpp(makeKimiK3TokenizerInfoJson(), options);
+}
+
+struct ModelThinkBoundaryCase {
+    const char*      name;
+    std::vector<int> begin_think_token_ids;
+    std::vector<int> end_think_token_ids;
+    int              vocab_size;
+};
+
+class ReasoningGrammarModelBoundaryTest: public testing::TestWithParam<ModelThinkBoundaryCase> {};
+
+std::string modelThinkBoundaryCaseName(const testing::TestParamInfo<ModelThinkBoundaryCase>& info) {
+    return info.param.name;
 }
 
 bool packedBitmaskAllowsToken(const int32_t* bitmask, int32_t token_id) {
@@ -75,6 +111,32 @@ TEST(GrammarLogitsProcessorTest, ProcessMasksDisallowedTokens) {
 
     EXPECT_GT(inputs.logits[0][static_cast<int>('a')].item<float>(), BaseLogitsProcessor::neg_inf);
     EXPECT_EQ(inputs.logits[0][static_cast<int>('b')].item<float>(), BaseLogitsProcessor::neg_inf);
+}
+
+TEST(GrammarLogitsProcessorTest, CompilesKimiK3XmlArguments) {
+    auto backend = makeKimiK3Backend();
+    auto compiled = backend.compileNow(
+        {"structural_tag",
+         R"({"type":"structural_tag","format":{"type":"json_schema","json_schema":{"type":"object",)"
+         R"("properties":{"name":{"type":"string"}},"required":["name"],"additionalProperties":false},)"
+         R"("style":"kimi_k3_xml"}})"})
+                        .compiled;
+    ASSERT_TRUE(compiled);
+
+    auto matcher = backend.createMatcher(compiled, false, std::nullopt);
+    ASSERT_TRUE(matcher->acceptToken(256));
+    for (char c : std::string("argument key=\"name\" type=\"string\"")) {
+        ASSERT_TRUE(matcher->acceptToken(static_cast<uint8_t>(c)));
+    }
+    ASSERT_TRUE(matcher->acceptToken(258));
+    for (char c : std::string("Bob")) {
+        ASSERT_TRUE(matcher->acceptToken(static_cast<uint8_t>(c)));
+    }
+    ASSERT_TRUE(matcher->acceptToken(257));
+    for (char c : std::string("argument")) {
+        ASSERT_TRUE(matcher->acceptToken(static_cast<uint8_t>(c)));
+    }
+    ASSERT_TRUE(matcher->acceptToken(258));
 }
 
 TEST(GrammarLogitsProcessorTest, UpdateStatusAdvancesMatcherToTerminal) {
@@ -446,6 +508,186 @@ TEST(ReasoningGrammarLogitsProcessorTest, JsonObjectConstrainsOnlyAfterThinkEnd)
     EXPECT_EQ(processor.acceptedTokenLen(), 3);
 }
 
+TEST(ReasoningGrammarLogitsProcessorTest, MasksReasoningStopsButAllowsSharedBoundaryPrefixes) {
+    auto backend  = makeBackend();
+    auto compiled = backend.compileNow({"json", R"({"type":"object"})"}).compiled;
+    ASSERT_TRUE(compiled);
+
+    auto matcher = backend.createMatcher(
+        compiled, /*require_reasoning=*/false, std::nullopt, /*terminate_without_stop_token=*/true);
+    ReasoningGrammarLogitsProcessor processor(matcher,
+                                              /*eos_token_id=*/0,
+                                              /*max_thinking_tokens=*/32,
+                                              {static_cast<int>('{'), static_cast<int>('q')},
+                                              {static_cast<int>('x'), static_cast<int>('y')},
+                                              /*input_length=*/0,
+                                              /*error_reporter=*/nullptr,
+                                              /*reasoning_stop_token_ids=*/{static_cast<int>('!')});
+
+    SamplerInputs inputs;
+    inputs.logits           = torch::zeros({1, 128}, torch::kFloat32);
+    inputs.finished_mask    = torch::zeros({1}, torch::kBool);
+    inputs.input_lengths    = torch::tensor({0}, torch::kInt32);
+    inputs.sequence_lengths = torch::tensor({0}, torch::kInt32);
+    inputs.vocab_size       = 128;
+    processor.process(inputs, 0, 1);
+
+    EXPECT_EQ(inputs.logits[0][0].item<float>(), BaseLogitsProcessor::neg_inf);
+    EXPECT_EQ(inputs.logits[0][static_cast<int>('!')].item<float>(), BaseLogitsProcessor::neg_inf);
+    EXPECT_EQ(inputs.logits[0][static_cast<int>('{')].item<float>(), 0.0f);
+    EXPECT_EQ(inputs.logits[0][static_cast<int>('x')].item<float>(), 0.0f);
+
+    processor.updateStatus(torch::tensor({{static_cast<int32_t>('{')}}, torch::kInt32), 1);
+    inputs.logits.zero_();
+    inputs.sequence_lengths = torch::tensor({1}, torch::kInt32);
+    processor.process(inputs, 0, 1);
+    EXPECT_EQ(inputs.logits[0][static_cast<int>('q')].item<float>(), BaseLogitsProcessor::neg_inf);
+
+    processor.updateStatus(torch::tensor({{static_cast<int32_t>('x'), static_cast<int32_t>('y')}}, torch::kInt32), 2);
+    inputs.logits.zero_();
+    inputs.sequence_lengths = torch::tensor({3}, torch::kInt32);
+    processor.process(inputs, 0, 1);
+
+    EXPECT_GT(inputs.logits[0][static_cast<int>('{')].item<float>(), BaseLogitsProcessor::neg_inf);
+    EXPECT_EQ(inputs.logits[0][static_cast<int>('a')].item<float>(), BaseLogitsProcessor::neg_inf);
+}
+
+TEST(ReasoningGrammarLogitsProcessorTest, SpecMasksAllSingleTokenReasoningStops) {
+    auto backend  = makeBackend();
+    auto compiled = backend.compileNow({"regex", "a"}).compiled;
+    ASSERT_TRUE(compiled);
+
+    auto matcher = backend.createMatcher(compiled, /*require_reasoning=*/false, std::nullopt);
+    ReasoningGrammarLogitsProcessor processor(matcher,
+                                              /*eos_token_id=*/0,
+                                              /*max_thinking_tokens=*/32,
+                                              {7, 1},
+                                              {8, 2},
+                                              /*input_length=*/0,
+                                              /*error_reporter=*/nullptr,
+                                              /*reasoning_stop_token_ids=*/{10});
+
+    const size_t         words = SpecLogitsProcessor::bitmaskWordCount(16);
+    std::vector<int32_t> draft = {10};
+    std::vector<int32_t> bitmask(2 * words, SpecLogitsProcessor::kBitmaskAllowAll);
+    SpecLogitsProcessorRequest request;
+    request.draft_tokens       = draft.data();
+    request.propose_step       = 1;
+    request.bitmask_cpu_out    = bitmask.data();
+    request.bitmask_size_int32 = words;
+    request.vocab_size         = 16;
+
+    EXPECT_EQ(0, processor.tryAcceptAndFillBitmask(request));
+    EXPECT_FALSE(packedBitmaskAllowsToken(bitmask.data(), 0));
+    EXPECT_FALSE(packedBitmaskAllowsToken(bitmask.data(), 10));
+    EXPECT_TRUE(packedBitmaskAllowsToken(bitmask.data(), 7));
+    EXPECT_TRUE(packedBitmaskAllowsToken(bitmask.data(), 8));
+}
+
+TEST(ThinkModeLogitsProcessorTest, KimiK3NaturalBoundaryAndReasoningStops) {
+    constexpr int kEosTokenId     = 163585;
+    constexpr int kEndOfMessageId = 163586;
+    constexpr int kOpenTokenId    = 163587;
+    constexpr int kCloseTokenId   = 163588;
+    auto generate_input = std::make_shared<GenerateInput>();
+    generate_input->generate_config = std::make_shared<GenerateConfig>();
+    generate_input->generate_config->in_think_mode         = true;
+    generate_input->generate_config->max_thinking_tokens   = 32;
+    generate_input->generate_config->begin_think_token_ids = {kOpenTokenId, 39964, 163589};
+    generate_input->generate_config->end_think_token_ids = {
+        kCloseTokenId, 39964, 163589, kOpenTokenId, 12092, 163589};
+    generate_input->generate_config->stop_words_list = {{kEndOfMessageId}};
+    generate_input->input_ids = torch::tensor({1, 2, 3}, torch::kInt32);
+
+    auto processor = ThinkModeLogitsProcessor::fromGenerateInput(generate_input, 1, kEosTokenId);
+    ASSERT_NE(processor, nullptr);
+
+    SamplerInputs inputs;
+    inputs.logits           = torch::zeros({1, 163600}, torch::kFloat32);
+    inputs.input_lengths    = torch::tensor({3}, torch::kInt32);
+    inputs.sequence_lengths = torch::tensor({3}, torch::kInt32);
+    inputs.vocab_size       = 163600;
+    processor->process(inputs, 0, 1);
+
+    EXPECT_EQ(inputs.logits[0][kEosTokenId].item<float>(), BaseLogitsProcessor::neg_inf);
+    EXPECT_EQ(inputs.logits[0][kEndOfMessageId].item<float>(), BaseLogitsProcessor::neg_inf);
+    EXPECT_EQ(inputs.logits[0][kOpenTokenId].item<float>(), 0.0f);
+    EXPECT_EQ(inputs.logits[0][kCloseTokenId].item<float>(), 0.0f);
+
+    processor->updateStatus(torch::tensor({{kCloseTokenId, 39964, 163589, kOpenTokenId, 12092, 163589}},
+                                          torch::kInt32),
+                            6);
+    inputs.logits.zero_();
+    inputs.sequence_lengths = torch::tensor({9}, torch::kInt32);
+    processor->process(inputs, 0, 1);
+
+    EXPECT_EQ(inputs.logits[0][kEosTokenId].item<float>(), 0.0f);
+    EXPECT_EQ(inputs.logits[0][kEndOfMessageId].item<float>(), 0.0f);
+    EXPECT_EQ(inputs.logits[0][kOpenTokenId].item<float>(), 0.0f);
+    EXPECT_EQ(inputs.logits[0][kCloseTokenId].item<float>(), 0.0f);
+}
+
+TEST(ThinkModeLogitsProcessorTest, SpecMasksReasoningStops) {
+    auto generate_input = std::make_shared<GenerateInput>();
+    generate_input->generate_config = std::make_shared<GenerateConfig>();
+    generate_input->generate_config->in_think_mode         = true;
+    generate_input->generate_config->max_thinking_tokens   = 32;
+    generate_input->generate_config->begin_think_token_ids = {7, 1};
+    generate_input->generate_config->end_think_token_ids   = {8, 2};
+    generate_input->generate_config->stop_words_list       = {{10}};
+    generate_input->input_ids = torch::tensor({1, 2, 3}, torch::kInt32);
+
+    auto processor = ThinkModeLogitsProcessor::fromGenerateInput(generate_input, 1, /*eos_token_id=*/11);
+    ASSERT_NE(processor, nullptr);
+
+    const size_t         words = SpecLogitsProcessor::bitmaskWordCount(16);
+    std::vector<int32_t> draft = {10};
+    std::vector<int32_t> bitmask(2 * words, SpecLogitsProcessor::kBitmaskAllowAll);
+    SpecLogitsProcessorRequest request;
+    request.draft_tokens       = draft.data();
+    request.propose_step       = 1;
+    request.bitmask_cpu_out    = bitmask.data();
+    request.bitmask_size_int32 = words;
+    request.vocab_size         = 16;
+
+    EXPECT_EQ(0, processor->tryAcceptAndFillBitmask(request));
+    EXPECT_FALSE(packedBitmaskAllowsToken(bitmask.data(), 10));
+    EXPECT_FALSE(packedBitmaskAllowsToken(bitmask.data(), 11));
+    EXPECT_TRUE(packedBitmaskAllowsToken(bitmask.data(), 7));
+    EXPECT_TRUE(packedBitmaskAllowsToken(bitmask.data(), 8));
+}
+
+TEST(ThinkModeLogitsProcessorTest, MasksOnlyBoundaryCompletionToken) {
+    auto generate_input = std::make_shared<GenerateInput>();
+    generate_input->generate_config = std::make_shared<GenerateConfig>();
+    generate_input->generate_config->in_think_mode         = false;
+    generate_input->generate_config->begin_think_token_ids = {7, 1};
+    generate_input->generate_config->end_think_token_ids   = {8, 2};
+    generate_input->input_ids = torch::tensor({3}, torch::kInt32);
+
+    auto processor = ThinkModeLogitsProcessor::fromGenerateInput(generate_input, 1);
+    ASSERT_NE(processor, nullptr);
+
+    SamplerInputs inputs;
+    inputs.logits     = torch::zeros({1, 16}, torch::kFloat32);
+    inputs.vocab_size = 16;
+    processor->process(inputs, 0, 1);
+    EXPECT_EQ(inputs.logits[0][7].item<float>(), 0.0f);
+    EXPECT_EQ(inputs.logits[0][8].item<float>(), 0.0f);
+
+    processor->updateStatus(torch::tensor({{7}}, torch::kInt32), 1);
+    inputs.logits.zero_();
+    processor->process(inputs, 0, 1);
+    EXPECT_EQ(inputs.logits[0][7].item<float>(), 0.0f);
+    EXPECT_EQ(inputs.logits[0][1].item<float>(), BaseLogitsProcessor::neg_inf);
+    EXPECT_EQ(inputs.logits[0][8].item<float>(), 0.0f);
+
+    processor->updateStatus(torch::tensor({{8}}, torch::kInt32), 1);
+    inputs.logits.zero_();
+    processor->process(inputs, 0, 1);
+    EXPECT_EQ(inputs.logits[0][2].item<float>(), BaseLogitsProcessor::neg_inf);
+}
+
 TEST(ReasoningGrammarLogitsProcessorTest, NaturalCloseForcesTrailingPadBeforeGrammar) {
     // end_think = [</think>='y', 271 (pad)]; pad stays in DFA, so a natural
     // </think> only matches the prefix and CLOSING_THINK force-emits 271 via
@@ -487,6 +729,93 @@ TEST(ReasoningGrammarLogitsProcessorTest, NaturalCloseForcesTrailingPadBeforeGra
     EXPECT_GT(inputs.logits[0][static_cast<int>('{')].item<float>(), BaseLogitsProcessor::neg_inf);
     EXPECT_EQ(inputs.logits[0][static_cast<int>('a')].item<float>(), BaseLogitsProcessor::neg_inf);
 }
+
+TEST_P(ReasoningGrammarModelBoundaryTest, NaturalBoundaryCompletesBeforeGrammar) {
+    const auto& profile = GetParam();
+    auto        backend = makeBackend();
+    auto        compiled = backend.compileNow({"regex", "a"}).compiled;
+    ASSERT_TRUE(compiled);
+
+    auto matcher = backend.createMatcher(
+        compiled, /*require_reasoning=*/false, std::nullopt, /*terminate_without_stop_token=*/true);
+    bool reported = false;
+    ReasoningGrammarLogitsProcessor processor(matcher,
+                                              /*eos_token_id=*/0,
+                                              /*max_thinking_tokens=*/32,
+                                              profile.begin_think_token_ids,
+                                              profile.end_think_token_ids,
+                                              /*input_length=*/0,
+                                              [&reported](ErrorCode, const std::string&, bool) { reported = true; });
+
+    processor.updateStatus(torch::tensor(profile.end_think_token_ids, torch::kInt32).unsqueeze(0),
+                           static_cast<int32_t>(profile.end_think_token_ids.size()));
+    EXPECT_FALSE(reported);
+    EXPECT_EQ(processor.acceptedTokenLen(), profile.end_think_token_ids.size());
+
+    SamplerInputs inputs;
+    inputs.logits           = torch::zeros({1, profile.vocab_size}, torch::kFloat32);
+    inputs.finished_mask    = torch::zeros({1}, torch::kBool);
+    inputs.input_lengths    = torch::tensor({0}, torch::kInt32);
+    inputs.sequence_lengths = torch::tensor({static_cast<int>(profile.end_think_token_ids.size())}, torch::kInt32);
+    inputs.vocab_size       = profile.vocab_size;
+    processor.process(inputs, 0, 1);
+
+    EXPECT_GT(inputs.logits[0][static_cast<int>('a')].item<float>(), BaseLogitsProcessor::neg_inf);
+    EXPECT_EQ(inputs.logits[0][static_cast<int>('b')].item<float>(), BaseLogitsProcessor::neg_inf);
+
+    processor.updateStatus(torch::tensor({{static_cast<int32_t>('a')}}, torch::kInt32), 1);
+    EXPECT_FALSE(reported);
+    EXPECT_EQ(processor.acceptedTokenLen(), profile.end_think_token_ids.size() + 1);
+}
+
+TEST_P(ReasoningGrammarModelBoundaryTest, NaturalCloseForcesTrailingBoundaryToken) {
+    const auto& profile = GetParam();
+    ASSERT_EQ(profile.end_think_token_ids.size(), 2);
+    auto backend  = makeBackend();
+    auto compiled = backend.compileNow({"regex", "a"}).compiled;
+    ASSERT_TRUE(compiled);
+
+    auto matcher = backend.createMatcher(
+        compiled, /*require_reasoning=*/false, std::nullopt, /*terminate_without_stop_token=*/true);
+    bool reported = false;
+    ReasoningGrammarLogitsProcessor processor(matcher,
+                                              /*eos_token_id=*/0,
+                                              /*max_thinking_tokens=*/32,
+                                              profile.begin_think_token_ids,
+                                              profile.end_think_token_ids,
+                                              /*input_length=*/0,
+                                              [&reported](ErrorCode, const std::string&, bool) { reported = true; });
+
+    processor.updateStatus(torch::tensor({{profile.end_think_token_ids.front()}}, torch::kInt32), 1);
+
+    SamplerInputs inputs;
+    inputs.logits           = torch::zeros({1, profile.vocab_size}, torch::kFloat32);
+    inputs.finished_mask    = torch::zeros({1}, torch::kBool);
+    inputs.input_lengths    = torch::tensor({0}, torch::kInt32);
+    inputs.sequence_lengths = torch::tensor({1}, torch::kInt32);
+    inputs.vocab_size       = profile.vocab_size;
+    processor.process(inputs, 0, 1);
+
+    const int trailing_token_id = profile.end_think_token_ids.back();
+    EXPECT_EQ(inputs.logits[0][trailing_token_id].item<float>(), 1.0f);
+    EXPECT_EQ(inputs.logits[0][static_cast<int>('a')].item<float>(), BaseLogitsProcessor::neg_inf);
+
+    processor.updateStatus(torch::tensor({{trailing_token_id}}, torch::kInt32), 1);
+    inputs.logits.zero_();
+    inputs.sequence_lengths = torch::tensor({2}, torch::kInt32);
+    processor.process(inputs, 0, 1);
+
+    EXPECT_FALSE(reported);
+    EXPECT_GT(inputs.logits[0][static_cast<int>('a')].item<float>(), BaseLogitsProcessor::neg_inf);
+    EXPECT_EQ(inputs.logits[0][static_cast<int>('b')].item<float>(), BaseLogitsProcessor::neg_inf);
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    ModelBoundaries,
+    ReasoningGrammarModelBoundaryTest,
+    testing::Values(ModelThinkBoundaryCase{"DeepSeekV4", {128821, 198}, {128822, 271}, 248100},
+                    ModelThinkBoundaryCase{"Qwen35", {248068, 198}, {248069, 271}, 248100}),
+    modelThinkBoundaryCaseName);
 
 TEST(ReasoningGrammarLogitsProcessorTest, SpecTryAcceptPassthroughThenGrammar) {
     auto backend  = makeBackend();

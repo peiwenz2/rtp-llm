@@ -238,6 +238,12 @@ BaseLogitsProcessorPtr createGrammarProcessor(std::shared_ptr<GenerateInput>    
 
     const bool terminate_without_stop_token = key.key_type == "json";
     if (config->in_think_mode) {
+        std::vector<int> reasoning_stop_token_ids;
+        for (const auto& stop_word : config->stop_words_list) {
+            if (stop_word.size() == 1) {
+                reasoning_stop_token_ids.push_back(stop_word.front());
+            }
+        }
         auto matcher = backend->createMatcher(
             compiled, /*require_reasoning=*/false, std::nullopt, terminate_without_stop_token);
         return std::make_shared<ReasoningGrammarLogitsProcessor>(std::move(matcher),
@@ -246,7 +252,8 @@ BaseLogitsProcessorPtr createGrammarProcessor(std::shared_ptr<GenerateInput>    
                                                                  config->begin_think_token_ids,
                                                                  config->end_think_token_ids,
                                                                  generate_input->inputLength(),
-                                                                 std::move(error_reporter));
+                                                                 std::move(error_reporter),
+                                                                 std::move(reasoning_stop_token_ids));
     }
 
     auto matcher = backend->createMatcher(
@@ -256,8 +263,9 @@ BaseLogitsProcessorPtr createGrammarProcessor(std::shared_ptr<GenerateInput>    
 
 void appendThinkProcessor(std::vector<BaseLogitsProcessorPtr>& result,
                           std::shared_ptr<GenerateInput>       generate_input,
-                          int32_t                              max_batch_size) {
-    auto think_processor = ThinkModeLogitsProcessor::fromGenerateInput(generate_input, max_batch_size);
+                          int32_t                              max_batch_size,
+                          int64_t                              eos_token_id) {
+    auto think_processor = ThinkModeLogitsProcessor::fromGenerateInput(generate_input, max_batch_size, eos_token_id);
     if (think_processor != nullptr) {
         result.push_back(std::static_pointer_cast<BaseLogitsProcessor>(think_processor));
     }
@@ -365,7 +373,7 @@ LogitsProcessorFactory::createLogitsProcessors(std::shared_ptr<GenerateInput> ge
     }
 
     if (grammar_key.empty()) {
-        appendThinkProcessor(result, generate_input, max_batch_size);
+        appendThinkProcessor(result, generate_input, max_batch_size, eos_token_id);
     } else if (config->in_think_mode) {
         if (config->hasNumBeams() || config->num_return_sequences > 1) {
             if (error_reporter) {

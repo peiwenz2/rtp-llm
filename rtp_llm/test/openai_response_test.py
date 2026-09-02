@@ -497,6 +497,15 @@ class OpenaiResponseTest(IsolatedAsyncioTestCase):
         self.assertNotIn("private prompt", json.dumps(summary))
         self.assertNotIn("do-not-log", json.dumps(summary))
 
+    def test_request_parameter_summary_defaults_parallel_tool_calls(self):
+        request = ChatCompletionRequest(
+            messages=[ChatMessage(role=RoleEnum.user, content="hello")]
+        )
+
+        summary = _openai_request_parameter_summary(request)
+
+        self.assertIsNone(summary["parallel_tool_calls"])
+
     async def test_parse_qwen_function_call(self):
         tokenizer = QwenTestTokenizer(
             f"{self.test_data_path}/qwen_7b/tokenizer/qwen.tiktoken"
